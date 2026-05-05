@@ -42,7 +42,8 @@ SUGGEST_THRESHOLD = 95.0
 STRICT_THRESHOLD = 100.0
 
 # Broad pre-filter for fallback date detection when no sample is available.
-# It only narrows obvious non-date values; strptime does the real validation._DATE_LIKE_RE = r'^[0-9A-Za-z/\-:.\sT,+]+(\s?[AP]M)?$'
+# It only narrows obvious non-date values; strptime does the real validation.
+_DATE_LIKE_RE = r'^[0-9A-Za-z/\-:.\sT,+]+(\s?[AP]M)?$'
 
 # (format, kind) ordered for correct precedence:
 #
