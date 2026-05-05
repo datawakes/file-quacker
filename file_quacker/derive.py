@@ -31,7 +31,7 @@ from typing import Any
 
 import duckdb
 
-from . import db
+from . import db, instrument
 from .db import display_ident as _display_ident
 
 SUGGEST_THRESHOLD = 95.0
@@ -41,10 +41,8 @@ SUGGEST_THRESHOLD = 95.0
 # typing decisions can't be reviewed by a human first.
 STRICT_THRESHOLD = 100.0
 
-# Regex pre-filter for values that plausibly look like dates / times.
-# Broad enough to admit named months ("Feb 14, 2024") and timezone
-# offsets ("+00:00"); strptime then rejects anything that doesn't
-# actually parse.
+# Broad pre-filter for fallback date detection when no sample is available.
+# It only narrows obvious non-date values; strptime does the real validation.
 _DATE_LIKE_RE = r'^[0-9A-Za-z/\-:.\sT,+]+(\s?[AP]M)?$'
 
 # (format, kind) ordered for correct precedence:
@@ -149,56 +147,94 @@ def suggest_casts(table_name: str) -> list[dict]:
     return out
 
 
-def _analyze_varchar_cols(qtable: str, col_names: list[str]) -> dict[str, dict]:
-    """Coverage + P/S + date-cascade for every VARCHAR column, run in
-    parallel across a worker pool.
+def _timed_analyze_one(qtable: str, col_name: str) -> tuple[str, dict]:
+    with instrument.timed('_analyze_one', col=col_name):
+        return col_name, _analyze_one(qtable, col_name)
 
-    Per-column queries turn out to be faster than one mega-aggregate
-    query (DuckDB's planner/executor overhead on hundreds of aggregates
-    outweighs the single-scan benefit), and threading gives a real 2–3×
-    wall-clock win since `db.conn()` hands out thread-safe cursors that
-    share one root connection.  Each column still scans the full table.
-    no sampling, so late-file outliers can't be missed.
+
+def _analyze_varchar_cols(qtable: str, col_names: list[str]) -> dict[str, dict]:
+    """Analyze VARCHAR columns in parallel.
+
+    Each column gets a small ASC/DESC distinct-value sniff first. The full-table
+    scan then runs only the type checks that the sniff indicates are useful.
+
+    Per-column queries are faster here than one large aggregate query, and worker
+    threads improve wall-clock time because DuckDB cursors share the same root
+    connection safely.
     """
     if not col_names:
         return {}
     max_workers = min(8, len(col_names))
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        pairs = list(ex.map(lambda n: (n, _analyze_one(qtable, n)), col_names))
+        pairs = list(ex.map(lambda n: _timed_analyze_one(qtable, n), col_names))
     return dict(pairs)
 
 
 def _analyze_one(qtable: str, col_name: str) -> dict:
-    """Single-column coverage + P/S + cascade analysis.  Thread-safe:
-    each call gets its own cursor from `db.conn()`."""
+    """Analyze one VARCHAR column using a sniff-gated full-table scan.
+
+    Each call uses its own DuckDB cursor. A small ASC/DESC distinct-value sniff
+    runs the broad type checks and date-format cascade first. The full-table scan
+    then skips type families that had zero sniff hits, and verifies only the
+    winning date format when one was found.
+
+    The ASC/DESC bracket helps catch edge-value outliers while keeping the sniff
+    small and deterministic.
+    """
     c = db.conn()
     qcol = db.quote_ident(col_name)
 
-    # Pass 1: coverage.  The integer / decimal / double regexes require
-    # `(0|[1-9]\d*)` for the integer part; disqualifies leading-zero
-    # strings like "010876" (BINs) or "01234" (ZIP codes) which are
-    # identifiers, not numbers, and would otherwise round-trip through
-    # a numeric type and lose the leading zero on export.  DOUBLE keeps
-    # an optional scientific-notation suffix so genuine `1.5e10`-style
-    # values still count.
-    row = c.execute(f"""
-        select  count({qcol})                                                                  as non_null
-        ,       sum(case when regexp_matches({qcol}, '^-?(0|[1-9]\\d*)(\\.0+)?$')
-                     and try_cast({qcol} as bigint) is not null then 1 else 0 end)              as ok_int
-        ,       sum(case when regexp_matches({qcol}, '^-?(0|[1-9]\\d*)(\\.\\d+)?$')
-                     then 1 else 0 end)                                                         as ok_dec
-        ,       sum(case when regexp_matches({qcol}, '^-?(0|[1-9]\\d*)(\\.\\d+)?([eE][+-]?\\d+)?$')
-                     and try_cast({qcol} as double) is not null then 1 else 0 end)              as ok_double
-        ,       sum(case when try_cast({qcol} as boolean) is not null then 1 else 0 end)        as ok_bool
-        ,       sum(case when try_cast({qcol} as date) is not null
-                     and cast(try_cast({qcol} as date) as varchar) = {qcol} then 1 else 0 end)  as ok_raw_date
-        ,       sum(case when try_cast({qcol} as timestamp) is not null then 1 else 0 end)      as ok_raw_ts
-        from    {qtable}
-        ;
-    """).fetchone()
-    non_null, ok_int, ok_dec, ok_double, ok_bool, ok_raw_date, ok_raw_ts = (
-        int(v or 0) for v in row
-    )
+    sniff = _sniff_one(c, qtable, qcol)
+
+    def _expr(skip: bool, sql: str) -> str:
+        return '0' if skip else sql
+
+    sn = sniff['n']
+    skip_int      = sn > 0 and sniff['int']      == 0
+    skip_dec      = sn > 0 and sniff['dec']      == 0
+    skip_double   = sn > 0 and sniff['double']   == 0
+    skip_bool     = sn > 0 and sniff['bool']     == 0
+    skip_raw_date = sn > 0 and sniff['raw_date'] == 0
+    skip_raw_ts   = sn > 0 and sniff['raw_ts']   == 0
+
+    int_sql      = (f"sum(case when regexp_matches({qcol}, '^-?(0|[1-9]\\d*)(\\.0+)?$')"
+                    f"          and try_cast({qcol} as bigint) is not null then 1 else 0 end)")
+    dec_sql      = (f"sum(case when regexp_matches({qcol}, '^-?(0|[1-9]\\d*)(\\.\\d+)?$')"
+                    f"          then 1 else 0 end)")
+    double_sql   = (f"sum(case when regexp_matches({qcol}, '^-?(0|[1-9]\\d*)(\\.\\d+)?([eE][+-]?\\d+)?$')"
+                    f"          and try_cast({qcol} as double) is not null then 1 else 0 end)")
+    bool_sql     = f"sum(case when try_cast({qcol} as boolean) is not null then 1 else 0 end)"
+    raw_date_sql = (f"sum(case when try_cast({qcol} as date) is not null"
+                    f"          and cast(try_cast({qcol} as date) as varchar) = {qcol} then 1 else 0 end)")
+    raw_ts_sql   = f"sum(case when try_cast({qcol} as timestamp) is not null then 1 else 0 end)"
+
+    # Pass 1: coverage.
+    # When the sniff finds no type candidates, a bare count(*) is enough.
+    n_active = sum(1 for s in (skip_int, skip_dec, skip_double, skip_bool,
+                                skip_raw_date, skip_raw_ts) if not s)
+    if n_active == 0:
+        with instrument.timed('coverage_pass', col=col_name, umbrellas=0):
+            (nn,) = c.execute(f"""
+                select  count({qcol}) from {qtable};
+            """).fetchone()
+        non_null = int(nn or 0)
+        ok_int = ok_dec = ok_double = ok_bool = ok_raw_date = ok_raw_ts = 0
+    else:
+        with instrument.timed('coverage_pass', col=col_name, umbrellas=n_active):
+            row = c.execute(f"""
+                select  count({qcol})                       as non_null
+                ,       {_expr(skip_int,      int_sql)}     as ok_int
+                ,       {_expr(skip_dec,      dec_sql)}     as ok_dec
+                ,       {_expr(skip_double,   double_sql)}  as ok_double
+                ,       {_expr(skip_bool,     bool_sql)}    as ok_bool
+                ,       {_expr(skip_raw_date, raw_date_sql)} as ok_raw_date
+                ,       {_expr(skip_raw_ts,   raw_ts_sql)}  as ok_raw_ts
+                from    {qtable}
+                ;
+            """).fetchone()
+        non_null, ok_int, ok_dec, ok_double, ok_bool, ok_raw_date, ok_raw_ts = (
+            int(v or 0) for v in row
+        )
 
     def pct(v: int) -> float:
         return round((v / non_null * 100.0), 2) if non_null else 0.0
@@ -210,15 +246,24 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
     double_pct   = pct(ok_double)
 
     # Pass 2: DECIMAL(P, S) sizing; only when decimal coverage qualifies.
+    # Sniff also skips this when the sample saw no decimal-shaped values.
     dec_p: int | None = None
     dec_s: int | None = None
-    if non_null and dec_pct >= SUGGEST_THRESHOLD:
+    if non_null and dec_pct >= SUGGEST_THRESHOLD and not skip_dec:
         dec_p, dec_s = _detect_decimal_ps(c, qtable, qcol)
 
-    # Pass 3: non-ISO date cascade; skip when the raw path already
-    # clears the threshold, AND skip when a numeric cast already clears
-    # it (_pick_suggestion favors numeric over cascade, so the 21-format
-    # strptime sweep would be thrown away).
+    # Pass 3: non-ISO date cascade.  Skipped when raw / numeric casts
+    # already clear threshold (`_pick_suggestion` would prefer those
+    # anyway).  When the cascade *is* needed, we lean on the sniff:
+    #   * it already ran the full 21-format strptime sweep on the
+    #     50-row bracket sample, so a zero-hit sample lets us skip
+    #     the full-table cascade outright (the dominant case for
+    #     plain-text columns); and
+    #   * when a format won the sample, we verify with that *one*
+    #     format on the full table instead of re-running 21
+    #     strptime calls per row.
+    # Fully-null columns (sn == 0) get the original 21-format full-
+    # table cascade as a fallback — no sample = no shortcut.
     cnt = 0
     kind: str | None = None
     fmt: str | None = None
@@ -229,7 +274,12 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
         or double_pct >= SUGGEST_THRESHOLD
     )
     if non_null and not raw_ok and not numeric_ok:
-        cnt, kind, fmt = _detect_date_format(c, qtable, qcol)
+        if sn == 0:
+            cnt, kind, fmt = _detect_date_format(c, qtable, qcol)
+        elif sniff['cascade_fmt'] is not None:
+            cnt, kind, fmt = _detect_date_format_single(
+                c, qtable, qcol, sniff['cascade_fmt'], sniff['cascade_kind'],
+            )
     cascade_pct = pct(cnt)
 
     date_pct = max(raw_date_pct, cascade_pct if kind == 'DATE'      else 0.0)
@@ -305,6 +355,91 @@ def _pick_suggestion(
     return None, None
 
 
+# Reusable date-format probes for the sniff sample.
+# fmt_<i> keeps result columns aligned with DATE_FORMATS.
+_SNIFF_FORMAT_CASES = ',\n            '.join(
+    f"sum(case when try_strptime(v, '{fmt.replace(chr(39), chr(39) * 2)}') "
+    f"is not null then 1 else 0 end) as fmt_{i}"
+    for i, (fmt, _kind) in enumerate(DATE_FORMATS)
+)
+
+
+def _sniff_one(c, qtable: str, qcol: str, n: int = 25) -> dict:
+    """Return ASC/DESC distinct-value sniff results for one column.
+
+    The sniff keeps up to `n` distinct values from each lexical edge, de-duping
+    overlap between the two sides. Using distinct values prevents repeated values
+    at one edge from hiding nearby outliers.
+
+    The returned hit counts let full-table analysis skip type families that had
+    zero sample hits.
+    """
+    with instrument.timed('_sniff_one', col=qcol, n=n):
+        row = c.execute(f"""
+            with cte_asc as
+            (   select  distinct {qcol} as v
+                from    {qtable}
+                where   {qcol} is not null
+                order   by v asc
+                limit   {int(n)}
+            ), cte_desc as
+            (   select  distinct {qcol} as v
+                from    {qtable}
+                where   {qcol} is not null
+                order   by v desc
+                limit   {int(n)}
+            ), cte_sample as
+            (   select  v from cte_asc
+                union
+                select  v from cte_desc
+            )
+            select  count(*)                                                                 as n
+            ,       sum(case when regexp_matches(v, '^-?(0|[1-9]\\d*)(\\.0+)?$')
+                         and try_cast(v as bigint) is not null then 1 else 0 end)            as ok_int
+            ,       sum(case when regexp_matches(v, '^-?(0|[1-9]\\d*)(\\.\\d+)?$')
+                         then 1 else 0 end)                                                  as ok_dec
+            ,       sum(case when regexp_matches(v, '^-?(0|[1-9]\\d*)(\\.\\d+)?([eE][+-]?\\d+)?$')
+                         and try_cast(v as double) is not null then 1 else 0 end)            as ok_double
+            ,       sum(case when try_cast(v as boolean) is not null then 1 else 0 end)      as ok_bool
+            ,       sum(case when try_cast(v as date) is not null
+                         and cast(try_cast(v as date) as varchar) = v then 1 else 0 end)     as ok_raw_date
+            ,       sum(case when try_cast(v as timestamp) is not null then 1 else 0 end)    as ok_raw_ts
+            ,       {_SNIFF_FORMAT_CASES}
+            from    cte_sample
+            ;
+        """).fetchone()
+    if not row or int(row[0] or 0) == 0:
+        return {'n': 0, 'int': 0, 'dec': 0, 'double': 0, 'bool': 0,
+                'raw_date': 0, 'raw_ts': 0,
+                'cascade_fmt': None, 'cascade_kind': None, 'cascade_hits': 0}
+
+    # Pick the date format with the most sample hits.
+    # Ties follow DATE_FORMATS order; zero hits skips full-table date checks.
+    fmt_hits = [int(v or 0) for v in row[7:7 + len(DATE_FORMATS)]]
+    best_idx = -1
+    best_hits = 0
+    for i, h in enumerate(fmt_hits):
+        if h > best_hits:
+            best_idx, best_hits = i, h
+    if best_idx >= 0:
+        cfmt, ckind = DATE_FORMATS[best_idx]
+    else:
+        cfmt, ckind = None, None
+
+    return {
+        'n':            int(row[0]),
+        'int':          int(row[1] or 0),
+        'dec':          int(row[2] or 0),
+        'double':       int(row[3] or 0),
+        'bool':         int(row[4] or 0),
+        'raw_date':     int(row[5] or 0),
+        'raw_ts':       int(row[6] or 0),
+        'cascade_fmt':  cfmt,
+        'cascade_kind': ckind,
+        'cascade_hits': best_hits,
+    }
+
+
 def _detect_decimal_ps(c, qtable: str, qcol: str) -> tuple[int | None, int | None]:
     """DECIMAL(P, S) sized to cover ~90% of observed precision.
 
@@ -314,27 +449,57 @@ def _detect_decimal_ps(c, qtable: str, qcol: str) -> tuple[int | None, int | Non
     (capped at 10) so outliers get rounded on cast.  Trailing zeros are
     trimmed so `"15.00"` → scale 0 and `"3.140"` → scale 2.
     """
-    row = c.execute(f"""
-        with cte_nums as
-        (   select  length(split_part(replace({qcol}, '-', ''), '.', 1))          as ilen
-            ,       case when position('.' in {qcol}) > 0
-                         then length(rtrim(split_part({qcol}, '.', 2), '0'))
-                         else 0 end                                               as s
-            from    {qtable}
-            where   {qcol} is not null
-            and     regexp_matches({qcol}, '^-?(0|[1-9]\\d*)(\\.\\d+)?$')
-        )
-        select  max(ilen)                   as max_int
-        ,       quantile_disc(s, 0.9)       as p90_scale
-        from    cte_nums
-        ;
-    """).fetchone()
+    with instrument.timed('_detect_decimal_ps', col=qcol):
+        row = c.execute(f"""
+            with cte_nums as
+            (   select  length(split_part(replace({qcol}, '-', ''), '.', 1))          as ilen
+                ,       case when position('.' in {qcol}) > 0
+                             then length(rtrim(split_part({qcol}, '.', 2), '0'))
+                             else 0 end                                               as s
+                from    {qtable}
+                where   {qcol} is not null
+                and     regexp_matches({qcol}, '^-?(0|[1-9]\\d*)(\\.\\d+)?$')
+            )
+            select  max(ilen)                   as max_int
+            ,       quantile_disc(s, 0.9)       as p90_scale
+            from    cte_nums
+            ;
+        """).fetchone()
     if row is None or row[0] is None:
         return None, None
     max_int   = max(int(row[0] or 1), 1)
     scale     = min(int(row[1] or 0), 10)
     precision = min(max_int + scale, 38)
     return precision, scale
+
+
+def _detect_date_format_single(
+    c,
+    qtable: str,
+    qcol: str,
+    fmt: str,
+    kind: str,
+) -> tuple[int, str | None, str | None]:
+    """Verify only the sample-winning date format against the full column.
+
+    This avoids rerunning the full date-format cascade when the sniff already
+    found the likely format.
+    """
+    safe_fmt = fmt.replace(chr(39), chr(39) * 2)
+    try:
+        with instrument.timed('_detect_date_format_single', col=qcol, fmt=fmt):
+            row = c.execute(f"""
+                select  count(*)
+                from    {qtable}
+                where   {qcol} is not null
+                and     try_strptime({qcol}, '{safe_fmt}') is not null
+                ;
+            """).fetchone()
+    except duckdb.Error:
+        return 0, None, None
+    if not row or row[0] is None:
+        return 0, None, None
+    return int(row[0]), kind, fmt
 
 
 def _detect_date_format(
@@ -353,23 +518,24 @@ def _detect_date_format(
     ]
     case_block = '\n                '.join(case_lines)
     try:
-        row = c.execute(f"""
-            select  detected
-            ,       count(*) as cnt
-            from (
-                select  case
-                    {case_block}
-                        else 'unparseable'
-                    end as detected
-                from    {qtable}
-                where   {qcol} is not null
-                and     regexp_matches({qcol}, '{_DATE_LIKE_RE}')
-            )
-            group   by detected
-            order   by count(*) desc
-            limit   1
-            ;
-        """).fetchone()
+        with instrument.timed('_detect_date_format', col=qcol, formats=len(DATE_FORMATS)):
+            row = c.execute(f"""
+                select  detected
+                ,       count(*) as cnt
+                from (
+                    select  case
+                        {case_block}
+                            else 'unparseable'
+                        end as detected
+                    from    {qtable}
+                    where   {qcol} is not null
+                    and     regexp_matches({qcol}, '{_DATE_LIKE_RE}')
+                )
+                group   by detected
+                order   by count(*) desc
+                limit   1
+                ;
+            """).fetchone()
     except duckdb.Error:
         return 0, None, None
     if not row:
