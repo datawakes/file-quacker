@@ -24,8 +24,9 @@ matter of writing a small naming class; no ddl.py changes required.
 
 from __future__ import annotations
 
+import re
 
-from . import db, derive
+from . import db, derive, instrument
 from .drivers import (
     Dialect,
     NumericResult,
@@ -33,6 +34,9 @@ from .drivers import (
     TimestampResult,
     dialect_for,
 )
+
+
+_DECIMAL_RE = re.compile(r'^DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$', re.IGNORECASE)
 
 
 _BIGINT_MIN = -(1 << 63)
@@ -51,28 +55,37 @@ _DATETIME_FLOOR = '1753-01-01'
 def generate(table_name: str, dialect: str = 'sqlserver') -> str:
     """Render a CREATE TABLE statement in `dialect`.  Defaults to
     SQL Server; any registered dialect id is valid."""
-    d = dialect_for(dialect)
-    c = db.conn()
-    qtable = db.quote_ident(table_name)
-    rows = c.execute(f"""
-        pragma table_info({qtable})
-        ;
-    """).fetchall()
-    if not rows:
-        raise ValueError(f'no columns for {table_name}')
+    # Drain any leftover events from a prior run so this run's summary
+    # only reflects work this call did.
+    instrument.take()
+    with instrument.timed('ddl.generate', table=table_name, dialect=dialect):
+        d = dialect_for(dialect)
+        c = db.conn()
+        qtable = db.quote_ident(table_name)
+        rows = c.execute(f"""
+            pragma table_info({qtable})
+            ;
+        """).fetchall()
+        if not rows:
+            raise ValueError(f'no columns for {table_name}')
 
-    col_infos: list[dict] = []
-    for row in rows:
-        name = row[1]
-        # `_src_row_num` is internal metadata; never appears in DDL.
-        if name == '_src_row_num':
-            continue
-        duck_type = row[2]
-        nullable = _has_nulls(c, qtable, name)
-        sql_type = _column_type(c, qtable, name, duck_type, d)
-        col_infos.append({'name': name, 'sql_type': sql_type, 'nullable': nullable})
+        col_infos: list[dict] = []
+        for row in rows:
+            name = row[1]
+            # `_src_row_num` is internal metadata; never appears in DDL.
+            if name == '_src_row_num':
+                continue
+            duck_type = row[2]
+            with instrument.timed('column.total', col=name, src=duck_type):
+                nullable = _has_nulls(c, qtable, name)
+                sql_type = _column_type(c, qtable, name, duck_type, d)
+            col_infos.append({'name': name, 'sql_type': sql_type, 'nullable': nullable})
 
-    return _format(table_name, col_infos, d)
+        rendered = _format(table_name, col_infos, d)
+
+    if instrument.enabled:
+        return rendered + '\n' + instrument.format_summary(instrument.take())
+    return rendered
 
 
 # --------------------------------------------------------------------------- #
@@ -81,12 +94,13 @@ def generate(table_name: str, dialect: str = 'sqlserver') -> str:
 
 def _has_nulls(c, qtable: str, col_name: str) -> bool:
     qcol = db.quote_ident(col_name)
-    (n, non_null) = c.execute(f"""
-        select  count(*)
-        ,       count({qcol})
-        from    {qtable}
-        ;
-    """).fetchone()
+    with instrument.timed('_has_nulls', col=col_name):
+        (n, non_null) = c.execute(f"""
+            select  count(*)
+            ,       count({qcol})
+            from    {qtable}
+            ;
+        """).fetchone()
     return int(n) != int(non_null)
 
 
@@ -109,10 +123,16 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
     if t == 'BLOB':
         return d.format_binary(_probe_blob_len(c, qtable, qcol))
 
-    if (t in ('FLOAT', 'REAL', 'DOUBLE')
-            or _is_integer(t)
-            or t.startswith('DECIMAL')
-            or t.startswith('NUMERIC')):
+    if _is_integer(t):
+        return _render_int_typed(c, qtable, qcol, d)
+
+    if t.startswith('DECIMAL') or t.startswith('NUMERIC'):
+        m = _DECIMAL_RE.match(t)
+        if m:
+            return d.format_decimal(int(m.group(1)), int(m.group(2)))
+        return _render_numeric(c, qtable, qcol, d)
+
+    if t in ('FLOAT', 'REAL', 'DOUBLE'):
         return _render_numeric(c, qtable, qcol, d)
 
     if t == 'VARCHAR':
@@ -131,6 +151,27 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
         return d.format_string(_probe_string(c, qtable, qcol))
 
     return d.format_unknown()
+
+
+def _render_int_typed(c, qtable: str, qcol: str, d: Dialect) -> str:
+    """Return the narrowest integer type for an already-typed integer column."""
+    with instrument.timed('_render_int_typed', col=qcol):
+        row = c.execute(f"""
+            select  min({qcol})
+            ,       max({qcol})
+            ,       count({qcol})
+            from    {qtable}
+            ;
+        """).fetchone()
+    if row is None or int(row[2] or 0) == 0:
+        formatted = d.format_int(0, 0)
+        return formatted if formatted is not None else d.format_decimal(1, 0)
+    mn, mx = int(row[0]), int(row[1])
+    formatted = d.format_int(mn, mx)
+    if formatted is not None:
+        return formatted
+    precision = max(1, len(str(max(abs(mn), abs(mx)))))
+    return d.format_decimal(min(precision, 38), 0)
 
 
 def _render_numeric(c, qtable: str, qcol: str, d: Dialect) -> str:
@@ -175,33 +216,34 @@ def _probe_numeric(c, qtable: str, qcol: str) -> NumericResult:
          exports (`nvarchar('5.00') → tinyint` would fail; →
          `decimal(P, 1)` succeeds).
     """
-    row = c.execute(f"""
-        with cte_strs as
-        (   select  try_cast({qcol} as varchar) as s
-            from    {qtable}
-            where   {qcol} is not null
-        ), cte_parts as
-        (   select  s
-            ,       length(split_part(replace(s, '-', ''), '.', 1))    as ilen
-            ,       case when position('.' in s) > 0
-                         then length(rtrim(split_part(s, '.', 2), '0'))
-                         else 0 end                                    as scl
-            ,       case when position('.' in s) > 0 then 1 else 0 end as has_dot
-            from    cte_strs
-            -- Leading-zero strings (e.g. "010876", "01234") aren't
-            -- numbers; they're identifiers that must round-trip as
-            -- text.  Excluding them here pushes the column to fallback
-            -- rendering, which the caller handles as varchar(N).
-            where   regexp_matches(s, '^[+-]?(0|[1-9]\\d*)(\\.\\d+)?$')
-        )
-        select  (select count(*) from cte_strs)   as n_total
-        ,       count(*)                          as n_plain
-        ,       max(ilen)                         as max_int
-        ,       quantile_disc(scl, 0.9)           as p90_scale
-        ,       max(has_dot)                      as has_dot
-        from    cte_parts
-        ;
-    """).fetchone()
+    with instrument.timed('_probe_numeric', col=qcol):
+        row = c.execute(f"""
+            with cte_strs as
+            (   select  try_cast({qcol} as varchar) as s
+                from    {qtable}
+                where   {qcol} is not null
+            ), cte_parts as
+            (   select  s
+                ,       length(split_part(replace(s, '-', ''), '.', 1))    as ilen
+                ,       case when position('.' in s) > 0
+                             then length(rtrim(split_part(s, '.', 2), '0'))
+                             else 0 end                                    as scl
+                ,       case when position('.' in s) > 0 then 1 else 0 end as has_dot
+                from    cte_strs
+                -- Leading-zero strings (e.g. "010876", "01234") aren't
+                -- numbers; they're identifiers that must round-trip as
+                -- text.  Excluding them here pushes the column to fallback
+                -- rendering, which the caller handles as varchar(N).
+                where   regexp_matches(s, '^[+-]?(0|[1-9]\\d*)(\\.\\d+)?$')
+            )
+            select  (select count(*) from cte_strs)   as n_total
+            ,       count(*)                          as n_plain
+            ,       max(ilen)                         as max_int
+            ,       quantile_disc(scl, 0.9)           as p90_scale
+            ,       max(has_dot)                      as has_dot
+            from    cte_parts
+            ;
+        """).fetchone()
 
     n_total = int(row[0] or 0) if row else 0
     if n_total == 0:
@@ -231,19 +273,20 @@ def _probe_numeric(c, qtable: str, qcol: str) -> NumericResult:
 def _narrowest_int_via_string(c, qtable: str, qcol: str) -> tuple[int, int] | None:
     """Compute (min, max) via try_cast(varchar → bigint).  Returns
     None when any value overflows bigint."""
-    row = c.execute(f"""
-        with cte as
-        (   select  try_cast(try_cast({qcol} as varchar) as bigint) as v
-            from    {qtable}
-            where   {qcol} is not null
-        )
-        select  min(v)
-        ,       max(v)
-        ,       count(v)
-        ,       count(*)
-        from    cte
-        ;
-    """).fetchone()
+    with instrument.timed('_narrowest_int_via_string', col=qcol):
+        row = c.execute(f"""
+            with cte as
+            (   select  try_cast(try_cast({qcol} as varchar) as bigint) as v
+                from    {qtable}
+                where   {qcol} is not null
+            )
+            select  min(v)
+            ,       max(v)
+            ,       count(v)
+            ,       count(*)
+            from    cte
+            ;
+        """).fetchone()
     if row is None or int(row[3] or 0) == 0:
         return None
     if int(row[2] or 0) < int(row[3]):
@@ -255,13 +298,14 @@ def _probe_timestamp(c, qtable: str, qcol: str) -> TimestampResult:
     """Whether the column needs sub-millisecond precision and whether
     any value precedes 1753-01-01.  SQL Server cares about both;
     DuckDB / Postgres don't (their `timestamp` covers everything)."""
-    row = c.execute(f"""
-        select  min(try_cast({qcol} as timestamp))     as mn
-        ,       max(extract(microsecond from try_cast({qcol} as timestamp))) as mx_us
-        from    {qtable}
-        where   {qcol} is not null
-        ;
-    """).fetchone()
+    with instrument.timed('_probe_timestamp', col=qcol):
+        row = c.execute(f"""
+            select  min(try_cast({qcol} as timestamp))     as mn
+            ,       max(extract(microsecond from try_cast({qcol} as timestamp))) as mx_us
+            from    {qtable}
+            where   {qcol} is not null
+            ;
+        """).fetchone()
     if row is None or row[0] is None:
         return TimestampResult(needs_subsecond=False, pre_1753=False)
     mn = str(row[0])
@@ -287,13 +331,14 @@ def _probe_blob_len(c, qtable: str, qcol: str) -> int | None:
 
 def _probe_string(c, qtable: str, qcol: str) -> StringResult:
     """Min / max string length for sizing varchar / char."""
-    row = c.execute(f"""
-        select  min(length({qcol}))
-        ,       max(length({qcol}))
-        from    {qtable}
-        where   {qcol} is not null
-        ;
-    """).fetchone()
+    with instrument.timed('_probe_string', col=qcol):
+        row = c.execute(f"""
+            select  min(length({qcol}))
+            ,       max(length({qcol}))
+            from    {qtable}
+            where   {qcol} is not null
+            ;
+        """).fetchone()
     if row is None or row[1] is None:
         return StringResult(min_len=0, max_len=1, fixed=False)
     min_len = int(row[0])
