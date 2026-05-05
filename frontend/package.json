@@ -20,7 +20,7 @@
     "@vueuse/core": "^14.3.0",
     "codemirror": "^6.0.0",
     "lucide-vue-next": "^0.460.0",
-    "pinia": "^2.2.0",
+    "pinia": "^3.0.4",
     "vue": "^3.4.0"
   },
   "devDependencies": {
