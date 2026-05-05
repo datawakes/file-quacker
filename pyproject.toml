@@ -45,12 +45,6 @@ version = { attr = "file_quacker.__version__" }
 [tool.setuptools.packages.find]
 include = ["file_quacker*"]
 
-[tool.ruff]
-# Scripts prefixed `_` are scratch / dev probes; `dedash*.py` are
-# one-off codebase migration helpers; neither part of the shipped
-# surface, so don't gate CI on their style.
-extend-exclude = ["scripts/_*.py", "scripts/dedash*.py"]
-
 [tool.ruff.lint]
 # E701 (multiple statements on one line via colon) is an intentional
 # style choice in a few places; column-aligned lookup tables in the
