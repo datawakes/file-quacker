@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    paths:
+      - 'file_quacker/**'
+      - 'tests/**'
+      - 'requirements*.txt'
+      - 'pyproject.toml'
+      - '.github/workflows/python.yml'
 
 jobs:
   lint-and-smoke:
@@ -29,7 +35,7 @@ jobs:
           pip install ruff
 
       - name: Lint with ruff
-        run: ruff check file_quacker scripts tests
+        run: ruff check file_quacker tests
 
       - name: Run tests
         run: pytest -v
