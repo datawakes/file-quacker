@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "file-quacker"
+description = "Local-first viewer / explorer / exporter for CSV, Parquet, and Excel files, backed by DuckDB."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+    "pywebview>=5.0",
+    "duckdb>=1.0",
+    "chardet>=5.0",
+    "pyodbc>=5.0",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.0",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+file-quacker = "file_quacker.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "file_quacker.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["file_quacker*"]
+
+[tool.ruff]
+# Scripts prefixed `_` are scratch / dev probes; `dedash*.py` are
+# one-off codebase migration helpers; neither part of the shipped
+# surface, so don't gate CI on their style.
+extend-exclude = ["scripts/_*.py", "scripts/dedash*.py"]
+
+[tool.ruff.lint]
+# E701 (multiple statements on one line via colon) is an intentional
+# style choice in a few places; column-aligned lookup tables in the
+# dialect modules, terse single-line guards.
+ignore = ["E701"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require external services (e.g. SQL Server); skipped by default",
+]
+addopts = "-m 'not integration'"

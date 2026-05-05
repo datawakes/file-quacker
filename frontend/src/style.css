@@ -1,0 +1,198 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens; File Quacker
+ *
+ * Precision & Density direction.  Pure-neutral foundation with an amber
+ * accent (nods to DuckDB + "Quacker"; distinctive vs. the generic
+ * Stripe-blue every data tool reaches for).  Borders-only depth, no
+ * shadows on data surfaces; shadows only on floating popovers.
+ *
+ * The `.dark` class is toggled on <html> by useTheme() based on either
+ * the OS preference (prefers-color-scheme) or an explicit user override
+ * persisted in localStorage.  Tokens are RGB triplets so Tailwind's
+ * arbitrary-alpha syntax (`bg-surface-1/80`) works.
+ */
+
+@layer base {
+  :root {
+    /* light theme */
+    --surface-0: 250 250 250;   /* app background */
+    --surface-1: 255 255 255;   /* elevated card / panel */
+    --surface-2: 244 244 245;   /* input, secondary surface */
+    --surface-3: 228 228 231;   /* hover / selected row */
+
+    --ink: 17 17 17;            /* primary text */
+    --ink-secondary: 63 63 70;
+    --ink-muted: 113 113 122;
+    --ink-subtle: 161 161 170;
+
+    --border: 228 228 231;      /* subtle divider */
+    --border-strong: 212 212 216;
+
+    --accent: 217 119 6;        /* amber-600 */
+    --accent-ink: 255 255 255;  /* text on accent */
+    --accent-subtle: 254 243 199;  /* amber-100, for badges */
+
+    --success: 22 163 74;
+    --warn: 202 138 4;
+    --danger: 220 38 38;
+
+    /* DuckDB yellow.  -fg darkens on light because #FBF100 has no
+       contrast on near-white. */
+    --fq-yellow:     251 241 0;    /* #FBF100, filled bg */
+    --fq-yellow-ink: 26 26 26;     /* text on the fill */
+    --fq-yellow-fg:  180 83 9;     /* amber-700 for fg use on light */
+  }
+
+  .dark {
+    --surface-0: 10 10 11;
+    --surface-1: 17 17 19;
+    --surface-2: 24 24 27;
+    --surface-3: 39 39 42;
+
+    --ink: 244 244 245;
+    --ink-secondary: 212 212 216;
+    --ink-muted: 161 161 170;
+    --ink-subtle: 113 113 122;
+
+    --border: 39 39 42;
+    --border-strong: 63 63 70;
+
+    --accent: 251 191 36;       /* amber-400, warmer glow on dark */
+    --accent-ink: 24 24 27;
+    --accent-subtle: 69 26 3;   /* deep amber for badges */
+
+    --success: 74 222 128;
+    --warn: 250 204 21;
+    --danger: 248 113 113;
+
+    /* Bright #FBF100 reads fine on dark surfaces. */
+    --fq-yellow-fg: 251 241 0;
+  }
+
+  html, body, #app {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    font-feature-settings: 'cv11', 'ss01', 'ss03';
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* thin, inconspicuous scrollbars (Windows) */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--border-strong));
+    border-radius: 4px;
+    border: 2px solid rgb(var(--surface-0));
+  }
+  ::-webkit-scrollbar-thumb:hover { background: rgb(var(--ink-subtle)); }
+}
+
+@layer components {
+  /* Icon-button: square, subtle background on hover, used in top bar + sidebar */
+  .btn-icon {
+    @apply inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-muted transition-colors;
+    @apply hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent;
+  }
+
+  /* Primary action button (amber) */
+  .btn-primary {
+    @apply inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-accent-ink;
+    @apply transition-colors hover:brightness-110 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent;
+    /* Disabled needs explicit styling; otherwise :hover lights up an
+       inert button (CSS runs before the HTML disabled gate). */
+    @apply disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:brightness-100;
+  }
+
+  /* Secondary button */
+  .btn-secondary {
+    @apply inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-border-strong bg-surface-1 px-3 py-1.5 text-xs font-medium text-ink;
+    @apply transition-colors hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent;
+  }
+
+  /* Destructive action: red fill + light ink. */
+  .btn-danger {
+    @apply inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-medium;
+    @apply transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent;
+    background-color: rgb(var(--fq-danger, 220 38 38));
+    color: white;
+  }
+  .btn-danger:hover { filter: brightness(1.1); }
+
+  /* Filled DuckDB-yellow button: bright bg + dark ink; reads in both themes. */
+  .btn-yellow {
+    @apply inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-medium;
+    @apply transition-[filter] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent;
+    background-color: rgb(var(--fq-yellow));
+    color: rgb(var(--fq-yellow-ink));
+  }
+  .btn-yellow:hover { filter: brightness(0.95); }
+
+  /* Foreground yellow on dark only.  Light mode keeps the base class's
+     own color (e.g. btn-icon's text-ink-muted). */
+  .dark .fq-yellow-fg,
+  .dark .fq-yellow-fg:hover {
+    color: rgb(var(--fq-yellow-fg));
+  }
+
+  /* Run button: filled yellow in light mode, neutral outline + yellow
+     text in dark so it doesn't scream against the dark UI. */
+  .btn-run {
+    @apply inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-medium;
+    @apply transition-[filter,background-color] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-40;
+    border: 1px solid transparent;
+    background-color: rgb(var(--fq-yellow));
+    color: rgb(var(--fq-yellow-ink));
+  }
+  .btn-run:hover { filter: brightness(0.95); }
+
+  .dark .btn-run {
+    @apply border-border-strong bg-surface-2;
+    color: rgb(var(--fq-yellow));
+    filter: none;
+  }
+  .dark .btn-run:hover {
+    @apply bg-surface-3;
+    filter: none;
+  }
+
+  /* Right-click overlay menu — used by both the data grid and the SQL
+     editor.  Fixed-positioned above the host content. */
+  .fq-ctx-menu {
+    position: fixed;
+    z-index: 50;
+    min-width: 180px;
+    border: 1px solid rgb(var(--border));
+    background: rgb(var(--surface-1));
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    border-radius: 4px;
+    padding: 4px 0;
+    font-size: 12px;
+  }
+  .fq-ctx-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 6px 12px;
+    color: rgb(var(--ink));
+    background: transparent;
+  }
+  .fq-ctx-item:hover:not(:disabled) {
+    background: rgb(var(--surface-2));
+  }
+  .fq-ctx-item:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .fq-ctx-sep {
+    height: 1px;
+    background: rgb(var(--border));
+    margin: 4px 0;
+  }
+}

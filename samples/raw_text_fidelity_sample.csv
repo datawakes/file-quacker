@@ -1,0 +1,10 @@
+id,patient_id,dob,code,balance,note
+1,PT007,2/2/24,007,"$1,000.00","he said ""hi"""
+2,PT008,2024-02-02,008,-45.50,plain text
+3,PT009,,,,"trailing space ⇢   "
+4,PT010,1/15/1999,010,0,TRUE
+5,PT011,31/12/2023,"012,A","1,234,567.89","unicode: café — ñoño"
+6,PT012,,,0.00,
+7,PT013,not a date,013,NULL_LITERAL,"embedded
+newline inside quotes"
+8,PT014,2024-13-45,014,∞,
