@@ -1,8 +1,9 @@
 """File Quacker entry point.
 
 Usage:
-    python -m file_quacker            # production: loads bundled frontend
-    python -m file_quacker --dev      # dev: points at the Vite dev server
+    python -m file_quacker             # production: loads bundled frontend
+    python -m file_quacker --dev       # dev: points at the Vite dev server
+    python -m file_quacker --trace     # add timing details to DDL output
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import webview
 # executed as `__main__`, not as `file_quacker.__main__`, so relative imports
 # (`.api`, `.assets`) fail with "attempted relative import with no known
 # parent package".
+from file_quacker import instrument
 from file_quacker.api import Api
 from file_quacker.assets import frontend_url
 
@@ -62,8 +64,15 @@ def _tint_titlebar(title: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog='file_quacker')
-    parser.add_argument('--dev', action='store_true', help='Load Vite dev server instead of bundled frontend')
+    parser.add_argument('--dev', action='store_true',
+                        help='Load Vite dev server instead of bundled frontend')
+    parser.add_argument('--trace', action='store_true',
+                        help='Enable timing telemetry; appends a breakdown to DDL output. '
+                             'Independent of --dev so you can profile against the bundled frontend.')
     args = parser.parse_args()
+
+    # Trace mode appends DDL/derive timing details to generated DDL output.
+    instrument.enabled = args.trace
 
     title = 'File Quacker'
     window = webview.create_window(
