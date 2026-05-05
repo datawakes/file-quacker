@@ -9,8 +9,8 @@
 </p>
 
 File Quacker is a local-first viewer, explorer, and exporter for **CSV,
-Parquet, and Excel** files. It is backed by **DuckDB** and rendered through
-**pywebview**.
+Parquet, and Excel** files. Built on **DuckDB** as the query engine and
+rendered through **pywebview**.
 
 The short version: open large flat files quickly, inspect what is actually in
 them, run real SQL, profile columns, derive cleaner typed copies, and export
