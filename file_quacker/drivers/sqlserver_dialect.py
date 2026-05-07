@@ -35,6 +35,10 @@ _BIGINT_MAX = (1 << 63) - 1
 class SqlServerDialect:
     id: str = 'sqlserver'
     display_name: str = 'SQL Server'
+    # bit only accepts 0/1/true/false on insert; Yes/No round-trips fine in
+    # DuckDB but blows up at the pyodbc bind. Keep the BOOLEAN suggestion
+    # to columns whose values are already in a bit-compatible shape.
+    boolean_accepts_yes_no: bool = False
 
     # ----- identifiers --------------------------------------------- #
     def quote_ident(self, name: str) -> str:
