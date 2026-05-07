@@ -62,6 +62,9 @@ interface Row {
   /** Carried from `suggest_casts` for non-ISO DATE / TIMESTAMP values;
    *  forwarded to the backend so it can use `try_strptime(col, fmt)`. */
   date_format: string | null
+  /** Set when a midnight-only TIMESTAMP column is being downgraded to
+   *  DATE; tells the backend to cast through TIMESTAMP first. */
+  via_timestamp: boolean
 }
 
 const rows = ref<Row[]>([])
@@ -90,6 +93,7 @@ onMounted(async () => {
         sample: s.sample_values,
         strict: false,
         date_format: s.detected_date_format,
+        via_timestamp: !!s.via_timestamp,
       }))
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
@@ -106,12 +110,16 @@ function specsFromRows(): CastSpec[] {
     // fall through to plain `try_cast` on the backend.
     const up = r.cast_to.trim().toUpperCase()
     const useFmt = (up === 'DATE' || up === 'TIMESTAMP') && r.cast_to === (r.suggested ?? '')
+    // via_timestamp only applies when the user kept the suggested DATE
+    // target; switching the type clears it.
+    const useViaTs = up === 'DATE' && r.cast_to === (r.suggested ?? '')
     return {
       source: r.source,
       target: r.target.trim() || r.source,
       cast_to: r.cast_to || null,
       strict: r.strict,
       date_format: useFmt ? r.date_format : null,
+      via_timestamp: useViaTs ? r.via_timestamp : false,
     }
   })
 }
