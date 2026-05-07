@@ -54,6 +54,34 @@ class ExcelTarget:
 FileTarget = FlatTarget | ParquetTarget | ExcelTarget
 
 
+# Whitespace classes the trim option strips off the ends of VARCHAR cells.
+# Mirrors elt_preprocess_ff.auto_trim and pandas str.strip():
+#   [[:space:]] – ASCII whitespace
+#   \p{Z}       – Unicode separator characters (NBSP, narrow NBSP, etc.)
+#   \x85        – NEL (C1 control)
+#   \x1c-\x1f   – FS / GS / RS / US (ASCII info separators)
+# Zero-width characters (ZWSP, ZWJ, BOM) are kept – they aren't whitespace.
+WS_TRIM_PATTERN = r'^[[:space:]\p{Z}\x85\x1c-\x1f]+|[[:space:]\p{Z}\x85\x1c-\x1f]+$'
+
+
+def _string_columns(qtable: str) -> set[str]:
+    """Names of VARCHAR columns on a DuckDB table or view."""
+    info = db.conn().execute(f"""
+        pragma table_info({qtable})
+        ;
+    """).fetchall()
+    return {row[1] for row in info if row[2].upper() == 'VARCHAR'}
+
+
+def _project(source: str, is_string: bool, trim_strings: bool) -> str:
+    """SELECT expression for one source column. String columns get wrapped
+    in regexp_replace when trim is on; everything else is the bare ident."""
+    qident = db.quote_ident(source)
+    if trim_strings and is_string:
+        return f"regexp_replace({qident}, '{WS_TRIM_PATTERN}', '', 'g')"
+    return qident
+
+
 _lock = RLock()
 _progress: dict = {'phase': 'idle', 'rows_written': 0, 'elapsed_ms': 0, 'error': None}
 _cancel_flag = False
@@ -77,8 +105,14 @@ def cancel() -> bool:
 
 
 def export_to_file(source: ExportSource | dict, target: dict,
-                   mappings: list[dict] | None = None) -> dict:
-    """Dispatch to the right exporter based on ``target['kind']``."""
+                   mappings: list[dict] | None = None,
+                   trim_strings: bool = True) -> dict:
+    """Dispatch to the right exporter based on ``target['kind']``.
+
+    ``trim_strings`` strips leading / trailing whitespace from every VARCHAR
+    source column on the way out (default on). Non-string columns are
+    untouched.
+    """
     global _cancel_flag, _running
     with _lock:
         if _running:
@@ -91,11 +125,11 @@ def export_to_file(source: ExportSource | dict, target: dict,
     kind = target.get('kind')
     try:
         if kind == 'flat':
-            return _export_flat(source, FlatTarget(**_strip_kind(target)), maps)
+            return _export_flat(source, FlatTarget(**_strip_kind(target)), maps, trim_strings)
         if kind == 'parquet':
-            return _export_parquet(source, ParquetTarget(**_strip_kind(target)), maps)
+            return _export_parquet(source, ParquetTarget(**_strip_kind(target)), maps, trim_strings)
         if kind == 'excel':
-            return _export_excel(source, ExcelTarget(**_strip_kind(target)), maps)
+            return _export_excel(source, ExcelTarget(**_strip_kind(target)), maps, trim_strings)
         raise ValueError(f'unknown target kind: {kind!r}')
     finally:
         with _lock:
@@ -118,16 +152,21 @@ def _strip_kind(d: dict) -> dict:
     return {k: v for k, v in d.items() if k != 'kind'}
 
 
-def _select_with_mappings(qtable: str, mappings: list[Mapping]) -> tuple[str, list[str]]:
+def _select_with_mappings(qtable: str, mappings: list[Mapping],
+                          trim_strings: bool = False) -> tuple[str, list[str]]:
     """Return ``(select_list, target_column_names)`` honoring the user's
     source→target renames.  Falls back to every non-meta column on the
-    table when mappings is empty.
+    table when mappings is empty. When ``trim_strings`` is on, VARCHAR
+    columns get wrapped in regexp_replace so leading / trailing whitespace
+    is stripped on the way out.
     """
+    str_cols = _string_columns(qtable) if trim_strings else set()
+
     if mappings:
-        parts = [
-            f'{db.quote_ident(m.source)} as {db.quote_ident(m.target)}'
-            for m in mappings
-        ]
+        parts = []
+        for m in mappings:
+            expr = _project(m.source, m.source in str_cols, trim_strings)
+            parts.append(f'{expr} as {db.quote_ident(m.target)}')
         targets = [m.target for m in mappings]
         return ', '.join(parts), targets
 
@@ -139,17 +178,23 @@ def _select_with_mappings(qtable: str, mappings: list[Mapping]) -> tuple[str, li
         ;
     """).fetchall()
     cols = [r[1] for r in info if r[1] != '_src_row_num']
-    return ', '.join(db.quote_ident(n) for n in cols), cols
+    parts = []
+    for n in cols:
+        expr = _project(n, n in str_cols, trim_strings)
+        # Trimmed string columns need an alias to keep the column name in
+        # the output; bare-ident projections don't.
+        parts.append(expr if expr == db.quote_ident(n) else f'{expr} as {db.quote_ident(n)}')
+    return ', '.join(parts), cols
 
 
 def _export_flat(source: ExportSource, tgt: FlatTarget,
-                 mappings: list[Mapping]) -> dict:
+                 mappings: list[Mapping], trim_strings: bool = False) -> dict:
     t0 = time.perf_counter()
     _set(phase='writing', rows_written=0, elapsed_ms=0, error=None)
     src_name, cleanup = source.materialize()
     try:
         qtable = db.quote_ident(src_name)
-        select_list, _ = _select_with_mappings(qtable, mappings)
+        select_list, _ = _select_with_mappings(qtable, mappings, trim_strings)
         # Parameter placeholders aren't supported inside COPY's option list,
         # so we literal-escape values.  Path is a trusted local path typed
         # by the user in their own app; single quotes are doubled defensively.
@@ -192,13 +237,13 @@ def _export_flat(source: ExportSource, tgt: FlatTarget,
 
 
 def _export_parquet(source: ExportSource, tgt: ParquetTarget,
-                    mappings: list[Mapping]) -> dict:
+                    mappings: list[Mapping], trim_strings: bool = False) -> dict:
     t0 = time.perf_counter()
     _set(phase='writing', rows_written=0, elapsed_ms=0, error=None)
     src_name, cleanup = source.materialize()
     try:
         qtable = db.quote_ident(src_name)
-        select_list, _ = _select_with_mappings(qtable, mappings)
+        select_list, _ = _select_with_mappings(qtable, mappings, trim_strings)
         path = tgt.path.replace("'", "''")
         compression = tgt.compression.upper()
         copy_sql = f"""
@@ -227,7 +272,7 @@ def _export_parquet(source: ExportSource, tgt: ParquetTarget,
 
 
 def _export_excel(source: ExportSource, tgt: ExcelTarget,
-                  mappings: list[Mapping]) -> dict:
+                  mappings: list[Mapping], trim_strings: bool = False) -> dict:
     import openpyxl  # lazy; only loaded when Excel export is used
 
     t0 = time.perf_counter()
@@ -235,7 +280,7 @@ def _export_excel(source: ExportSource, tgt: ExcelTarget,
     src_name, cleanup = source.materialize()
     try:
         qtable = db.quote_ident(src_name)
-        select_list, target_cols = _select_with_mappings(qtable, mappings)
+        select_list, target_cols = _select_with_mappings(qtable, mappings, trim_strings)
         c = db.conn()
         cur = c.execute(f"""
             select  {select_list}
