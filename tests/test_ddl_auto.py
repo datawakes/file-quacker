@@ -36,6 +36,79 @@ def test_auto_derive_plus_ddl_for_both_dialects():
     assert 'varchar' in ddl_duck.lower() and 'varchar' in ddl_mssql.lower()
 
 
+def test_ddl_renders_date_for_typed_timestamp_all_midnight():
+    """A typed TIMESTAMP column whose values all sit at midnight renders
+    as DATE in DDL — no point padding the column with `00:00:00` time
+    components on every row."""
+    p = Path(tempfile.gettempdir()) / 'fq_ddl_midnight.csv'
+    p.write_text(
+        'created_at\n'
+        '2024-01-15 00:00:00\n'
+        '2024-02-02 00:00:00\n',
+        encoding='utf-8',
+    )
+    r = ingest.load_file(str(p))
+    api = Api()
+    typed = api.auto_derive(r.name, f'{r.name}_typed')
+    ddl_mssql = api.generate_ddl(typed['name'], 'sqlserver')['sql'].lower()
+    ddl_duck  = api.generate_ddl(typed['name'], 'duckdb')['sql'].lower()
+    assert 'date' in ddl_mssql and 'datetime' not in ddl_mssql
+    assert 'date' in ddl_duck and 'timestamp' not in ddl_duck
+
+
+def test_alphanumeric_outlier_at_scale_falls_through_to_varchar():
+    """At ~100k rows, one stray alphanumeric value gives 99.999% numeric
+    coverage. Plain percentage rounding would push that up to 100.0 and
+    the strict threshold check would treat the column as numeric, so the
+    column landed as decimal(38, 10) and blew up at export. The pct()
+    clamp keeps 100.0 for true-100% only.
+    """
+    n_clean = 100_000
+    p = Path(tempfile.gettempdir()) / 'fq_alpha_scale.csv'
+    rows = ['lot_number'] + [str(i + 10000) for i in range(n_clean)] + ['f7039']
+    p.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    r = ingest.load_file(str(p))
+    ddl = Api().generate_ddl(r.name, 'sqlserver')['sql'].lower()
+    assert 'numeric' not in ddl
+    assert 'decimal' not in ddl
+    assert re.search(r'\blot_number\b\s+(varchar|char)', ddl), ddl
+
+
+def test_yes_no_column_renders_as_varchar_for_sqlserver():
+    """A column of Yes/No values – which DuckDB happily casts to bool but
+    SQL Server's bit rejects on insert – should land as varchar in the
+    SQL Server DDL. DuckDB DDL keeps the boolean suggestion since DuckDB's
+    bool type accepts the wider set of strings."""
+    p = Path(tempfile.gettempdir()) / 'fq_yes_no.csv'
+    p.write_text(
+        'is_active\nYes\nNo\nYes\nYes\nNo\n',
+        encoding='utf-8',
+    )
+    r = ingest.load_file(str(p))
+    api = Api()
+    ddl_mssql = api.generate_ddl(r.name, 'sqlserver')['sql'].lower()
+    ddl_duck  = api.generate_ddl(r.name, 'duckdb')['sql'].lower()
+
+    assert 'is_active' in ddl_mssql
+    assert 'bit' not in ddl_mssql
+    assert re.search(r'\bis_active\b\s+varchar\(\d+\)', ddl_mssql), ddl_mssql
+    # DuckDB keeps the wider boolean acceptance.
+    assert 'boolean' in ddl_duck
+
+
+def test_zero_one_column_still_renders_as_bit_for_sqlserver():
+    """A column of strict 0/1/true/false strings is still safe as bit –
+    only the wider DuckDB-style boolean strings get downgraded."""
+    p = Path(tempfile.gettempdir()) / 'fq_one_zero.csv'
+    p.write_text(
+        'flag\n1\n0\n1\nTrue\nfalse\n',
+        encoding='utf-8',
+    )
+    r = ingest.load_file(str(p))
+    ddl_mssql = Api().generate_ddl(r.name, 'sqlserver')['sql'].lower()
+    assert re.search(r'\bflag\b\s+bit', ddl_mssql), ddl_mssql
+
+
 def test_ddl_decimal_sized_from_raw_varchar():
     """generate_ddl on a raw VARCHAR table sizes DECIMAL straight from the
     values: max integer digits and max trimmed scale. The has_dot floor lifts
