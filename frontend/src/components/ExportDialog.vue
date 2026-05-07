@@ -78,6 +78,10 @@ const ifExists = ref<'fail' | 'drop' | 'append'>('fail')
 interface Row extends ExportColumnMapping { source_type: string }
 const rows = ref<Row[]>([])
 
+// Strip leading/trailing whitespace from VARCHAR cells on the way out.
+// On by default — matches the ELT preprocess_ff convention.
+const trimStrings = ref(true)
+
 // --- preview + status ------------------------------------------------ //
 const ddl = ref('')
 const driverCheck = ref<{ ok: boolean; drivers: string[]; required: string } | null>(null)
@@ -154,6 +158,7 @@ function buildExportOpts(): SqlServerExportOptions {
       source_type: r.source_type,
     })),
     if_exists: ifExists.value,
+    trim_strings: trimStrings.value,
   }
 }
 
@@ -213,7 +218,7 @@ async function onExportFile() {
       sql_type: r.sql_type, nullable: r.nullable,
       source_type: r.source_type,
     }))
-    const r = await exportToFile(props.source, fileTarget.value, fileMappings)
+    const r = await exportToFile(props.source, fileTarget.value, fileMappings, trimStrings.value)
     lastResult.value = r.ok
       ? { ok: true, rows_written: r.rows_written, elapsed_ms: r.elapsed_ms }
       : { ok: false, error: r.error, elapsed_ms: r.elapsed_ms }
@@ -433,9 +438,16 @@ const fileOperationPreview = computed(() => {
             class="flex min-h-0 shrink-0 flex-col"
             :style="{ width: mappingWidth + 'px' }"
           >
-            <div class="flex shrink-0 items-center justify-between px-3 pb-1 pt-3">
+            <div class="flex shrink-0 items-center justify-between gap-3 px-3 pb-1 pt-3">
               <h3 class="text-2xs uppercase tracking-wide text-ink-subtle">Column mapping</h3>
-              <span class="text-2xs text-ink-subtle">{{ rows.length }} cols</span>
+              <label
+                class="flex items-center gap-1.5 text-2xs text-ink-muted"
+                title="Strip leading and trailing whitespace from VARCHAR cells on the way out. Non-string columns are unaffected."
+              >
+                <input v-model="trimStrings" type="checkbox" />
+                <span>Trim whitespace</span>
+              </label>
+              <span class="ml-auto text-2xs text-ink-subtle">{{ rows.length }} cols</span>
             </div>
             <div class="min-h-0 flex-1 overflow-y-auto px-3 pb-3 text-xs">
               <div v-if="loading" class="text-ink-subtle">Inspecting columns…</div>
