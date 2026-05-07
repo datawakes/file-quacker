@@ -45,6 +45,17 @@ STRICT_THRESHOLD = 100.0
 # It only narrows obvious non-date values; strptime does the real validation.
 _DATE_LIKE_RE = r'^[0-9A-Za-z/\-:.\sT,+]+(\s?[AP]M)?$'
 
+# Plain decimal literal: optional minus, no leading zeros, optional fractional
+# part. Shared by the type probes (`_detect_decimal_ps`, `ddl._probe_numeric`)
+# so they agree on what counts as a tightly-sizeable decimal. Identifier-shaped
+# strings like '010876' are excluded so they round-trip as text.
+PLAIN_DECIMAL_RE = r'^-?(0|[1-9]\d*)(\.\d+)?$'
+
+# Same as above, but also matches scientific notation (`1.23e-5`, `2.5E+10`).
+# Used by the Excel ingest snap so values DuckDB hands back as sci notation
+# get rewritten to plain decimal alongside the other numeric cells.
+SNAPPABLE_NUMERIC_RE = r'^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$'
+
 # (format, kind) ordered for correct precedence:
 #
 #   * Time-bearing formats first; they're more specific than
@@ -441,13 +452,18 @@ def _sniff_one(c, qtable: str, qcol: str, n: int = 25) -> dict:
 
 
 def _detect_decimal_ps(c, qtable: str, qcol: str) -> tuple[int | None, int | None]:
-    """DECIMAL(P, S) sized to cover ~90% of observed precision.
+    """Pick DECIMAL(P, S) from the largest precision observed in the column.
 
-    `max(scale)` naively would let a single Excel-compute artifact like
-    `3.66666666666667` balloon the scale to 14, padding zeros onto every
-    value.  `quantile_disc(scale, 0.9)` uses the 90th-percentile scale
-    (capped at 10) so outliers get rounded on cast.  Trailing zeros are
-    trimmed so `"15.00"` → scale 0 and `"3.140"` → scale 2.
+    Trailing zeros are stripped first so '15.00' reads as scale 0 and '3.140'
+    reads as scale 2. The source is then trusted as-is. Excel float artifacts
+    are already cleaned up at ingest by `ingest._snap_excel_numerics`.
+
+    A `has_dot` floor of 1 keeps a column of `1.00`-padded integers from
+    collapsing to scale 0, which would break VARCHAR exports that bind to a
+    narrow integer column.
+
+    When `max_int + scale` would exceed 38 (SQL Server's decimal ceiling),
+    scale is reduced first so the integer side is preserved.
     """
     with instrument.timed('_detect_decimal_ps', col=qcol):
         row = c.execute(f"""
@@ -456,19 +472,24 @@ def _detect_decimal_ps(c, qtable: str, qcol: str) -> tuple[int | None, int | Non
                 ,       case when position('.' in {qcol}) > 0
                              then length(rtrim(split_part({qcol}, '.', 2), '0'))
                              else 0 end                                               as s
+                ,       case when position('.' in {qcol}) > 0 then 1 else 0 end       as has_dot
                 from    {qtable}
                 where   {qcol} is not null
-                and     regexp_matches({qcol}, '^-?(0|[1-9]\\d*)(\\.\\d+)?$')
+                and     regexp_matches({qcol}, '{PLAIN_DECIMAL_RE}')
             )
             select  max(ilen)                   as max_int
-            ,       quantile_disc(s, 0.9)       as p90_scale
+            ,       max(s)                      as max_scale
+            ,       max(has_dot)                as has_dot
             from    cte_nums
             ;
         """).fetchone()
     if row is None or row[0] is None:
         return None, None
     max_int   = max(int(row[0] or 1), 1)
-    scale     = min(int(row[1] or 0), 10)
+    max_scl   = int(row[1] or 0)
+    has_dot   = int(row[2] or 0) == 1
+    scale     = max(max_scl, 1 if has_dot else 0)
+    scale     = min(scale, max(0, 38 - max_int))
     precision = min(max_int + scale, 38)
     return precision, scale
 

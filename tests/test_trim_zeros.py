@@ -33,9 +33,12 @@ def test_real_fractional_precision():
     assert actual['x'] == 'DECIMAL(4,3)'
 
 
-def test_outlier_rounds_to_observed_scale():
+def test_csv_artifact_inflates_scale_unprotected():
+    """Non-Excel sources are trusted as-is. Excel files are handled during
+    ingest (see test_excel_snap.py).
+    """
     actual = _suggestions_for(
         'sec_ince_amt\n'
         '15\n50\n290.08\n290.08\n100.39\n0\n24.97\n130\n130\n3.66666666666667\n'
     )
-    assert actual['sec_ince_amt'] == 'DECIMAL(5,2)'
+    assert actual['sec_ince_amt'] == 'DECIMAL(17,14)'

@@ -26,7 +26,7 @@ from typing import Literal
 import chardet
 import duckdb
 
-from . import db
+from . import db, derive
 
 CandidateDelim = Literal[',', '|', ';', '\t']
 CANDIDATE_DELIMS: tuple[CandidateDelim, ...] = (',', '|', ';', '\t')
@@ -562,12 +562,68 @@ def _load_xlsx(path: Path, opts: IngestOptions) -> IngestResult:
 
     if opts.materialize and opts.nullify_tokens:
         _nullify_string_tokens(name, opts.nullify_tokens)
+    if opts.materialize:
+        _snap_excel_numerics(name)
     row_count, col_count, cols = _describe(name)
     return IngestResult(
         name=name, source_path=str(path), format='xlsx',
         materialized=opts.materialize, row_count=row_count,
         col_count=col_count, has_rejects=False, columns=cols,
     )
+
+
+def _snap_excel_numerics(table_name: str) -> None:
+    """Round Excel float artifacts in numeric cells to a clean scale.
+
+    Excel stores numeric cells as doubles, so a cell like `=11/3` lands as
+    3.66666666666667. Each numeric cell is rounded to the nearest clean
+    scale (0, 2, 4, or 6) when it sits within `1e-10` of one; anything
+    further out falls through to `round(., 8)` as the upper limit.
+
+    Scientific-notation cells (DuckDB hands these back for very small or
+    very large numbers) get rewritten to plain decimal by the same cascade.
+    Values too large to fit `decimal(38, N)` keep their original text via
+    the `try_cast` fallback and flow through the export-time fallback path.
+
+    The cleaned value is cast through `decimal(...)` so integers emit as
+    '5' instead of '5.0'. Trailing-zero trimming is handled later by the
+    type-derivation layer.
+    """
+    c = db.conn()
+    qname = db.quote_ident(table_name)
+    cols = c.execute(f"""
+        pragma table_info({qname})
+        ;
+    """).fetchall()
+    for row in cols:
+        col_name = row[1]
+        col_type = row[2].upper()
+        if col_type != 'VARCHAR':
+            continue
+        if col_name == ROW_NUM_COLUMN:
+            continue
+        qcol = db.quote_ident(col_name)
+        v = f'cast({qcol} as double)'
+        # try_cast on the inner decimal cast so a magnitude that overflows
+        # decimal(38, N) leaves the cell untouched instead of aborting the
+        # whole UPDATE.
+        def snap(scale: int) -> str:
+            return (f'coalesce(try_cast(try_cast({v} as decimal(38, {scale})) '
+                    f'as varchar), {qcol})')
+        c.execute(f"""
+            update  {qname}
+            set     {qcol} = case
+                                when abs({v}) < 1e-12                       then '0'
+                                when abs({v} - round({v}, 0)) < 1e-10       then {snap(0)}
+                                when abs({v} - round({v}, 2)) < 1e-10       then {snap(2)}
+                                when abs({v} - round({v}, 4)) < 1e-10       then {snap(4)}
+                                when abs({v} - round({v}, 6)) < 1e-10       then {snap(6)}
+                                else                                             {snap(8)}
+                             end
+            where   {qcol} is not null
+            and     regexp_matches({qcol}, '{derive.SNAPPABLE_NUMERIC_RE}')
+            ;
+        """)
 
 
 def _is_styles_xml_error(ex: BaseException) -> bool:
