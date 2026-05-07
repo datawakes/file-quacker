@@ -215,6 +215,11 @@ function onCellMouseDown(rowIdx: number, colDisp: number, e: MouseEvent) {
   if (props.source.skipUnloadedRows && rowAt(rowIdx) == null) return
   e.preventDefault()
   blurActiveEditor()
+  // Drop any leftover text selection from elsewhere on the page.
+  // mousedown.preventDefault() blocks the browser's default selection-clear,
+  // so without this a stale text selection (SQL editor, sidebar, etc.)
+  // would steal the Ctrl+C handler away from the grid.
+  window.getSelection()?.removeAllRanges()
   contextMenu.value = null
   if (e.shiftKey && anchor.value) {
     selection.value = normalize(anchor.value, { row: rowIdx, col: colDisp })
@@ -236,6 +241,7 @@ function onRowNumMouseDown(rowIdx: number, e: MouseEvent) {
   if (e.button !== 0) return
   e.preventDefault()
   blurActiveEditor()
+  window.getSelection()?.removeAllRanges()
   contextMenu.value = null
   if (e.shiftKey && anchor.value) {
     setRowSelection(anchor.value.row, rowIdx)
@@ -251,7 +257,66 @@ function onRowNumMouseEnter(rowIdx: number) {
   setRowSelection(anchor.value.row, rowIdx)
 }
 
-function onWindowMouseUp() { dragging.value = null }
+function onWindowMouseUp() {
+  dragging.value = null
+  stopAutoScroll()
+}
+
+// ---- autoscroll while drag-selecting past the viewport edge --------- //
+// mousemove tracks the cursor; a rAF loop scrolls the parent container
+// whenever the cursor sits inside the edge band. Current browsers fire
+// mouseenter on rows that scroll under a stationary cursor, so the
+// existing selection-extend logic just keeps working as new rows pass
+// under the pointer.
+const AUTOSCROLL_MARGIN = 24
+const AUTOSCROLL_MAX_STEP = 24
+let autoScrollFrame: number | undefined
+let lastMouseX = 0
+let lastMouseY = 0
+
+function onWindowMouseMove(e: MouseEvent) {
+  if (!dragging.value) return
+  lastMouseX = e.clientX
+  lastMouseY = e.clientY
+  if (autoScrollFrame == null) scheduleAutoScroll()
+}
+
+function scheduleAutoScroll() {
+  autoScrollFrame = window.requestAnimationFrame(() => {
+    autoScrollFrame = undefined
+    if (!dragging.value) return
+    const el = parentRef.value
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    const step = (overshoot: number) =>
+      Math.min(AUTOSCROLL_MAX_STEP, Math.ceil(overshoot / 2))
+
+    let dy = 0
+    if (lastMouseY < rect.top + AUTOSCROLL_MARGIN) {
+      dy = -step(rect.top + AUTOSCROLL_MARGIN - lastMouseY)
+    } else if (lastMouseY > rect.bottom - AUTOSCROLL_MARGIN) {
+      dy = step(lastMouseY - (rect.bottom - AUTOSCROLL_MARGIN))
+    }
+    let dx = 0
+    if (lastMouseX < rect.left + AUTOSCROLL_MARGIN) {
+      dx = -step(rect.left + AUTOSCROLL_MARGIN - lastMouseX)
+    } else if (lastMouseX > rect.right - AUTOSCROLL_MARGIN) {
+      dx = step(lastMouseX - (rect.right - AUTOSCROLL_MARGIN))
+    }
+    if (dx !== 0 || dy !== 0) {
+      el.scrollTop += dy
+      el.scrollLeft += dx
+      scheduleAutoScroll()
+    }
+  })
+}
+
+function stopAutoScroll() {
+  if (autoScrollFrame != null) {
+    window.cancelAnimationFrame(autoScrollFrame)
+    autoScrollFrame = undefined
+  }
+}
 
 function onCellContextMenu(rowIdx: number, colDisp: number, e: MouseEvent) {
   if (props.source.skipUnloadedRows && rowAt(rowIdx) == null) return
@@ -318,9 +383,16 @@ function serializeTSV(includeHeaders: boolean): string {
   return lines.join('\n')
 }
 
-async function copyAsTSV(includeHeaders: boolean) {
-  if (!selection.value) return
-  const text = serializeTSV(includeHeaders)
+function serializeHeaders(): string {
+  const s = selection.value
+  if (!s) return ''
+  const cols = props.source.displayCols.value
+  const names: string[] = []
+  for (let c = s.c0; c <= s.c1; c++) names.push(cols[c]?.displayName ?? '')
+  return names.join('\t')
+}
+
+async function writeToClipboard(text: string) {
   try {
     await navigator.clipboard.writeText(text)
     flashing.value = true
@@ -329,6 +401,16 @@ async function copyAsTSV(includeHeaders: boolean) {
     console.warn('[Grid] copy failed:', e)
   }
   closeContextMenu()
+}
+
+async function copyAsTSV(includeHeaders: boolean) {
+  if (!selection.value) return
+  await writeToClipboard(serializeTSV(includeHeaders))
+}
+
+async function copyHeadersOnly() {
+  if (!selection.value) return
+  await writeToClipboard(serializeHeaders())
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -357,6 +439,7 @@ function onKeydown(e: KeyboardEvent) {
 onMounted(() => {
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('mouseup', onWindowMouseUp)
+  window.addEventListener('mousemove', onWindowMouseMove)
   // Outside-click closes the context menu.  contextmenu doesn't fire
   // 'click', so opening a menu won't immediately close it.
   window.addEventListener('click', closeContextMenu)
@@ -364,7 +447,9 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('mouseup', onWindowMouseUp)
+  window.removeEventListener('mousemove', onWindowMouseMove)
   window.removeEventListener('click', closeContextMenu)
+  stopAutoScroll()
 })
 
 // Reset selection + scroll when the underlying data set changes.
@@ -545,6 +630,9 @@ function fmtCell(v: unknown): { text: string; isNull: boolean } {
       </button>
       <button class="fq-ctx-item" @click="copyAsTSV(true)">
         Copy with Headers
+      </button>
+      <button class="fq-ctx-item" @click="copyHeadersOnly()">
+        Headers Only
       </button>
     </div>
   </div>
