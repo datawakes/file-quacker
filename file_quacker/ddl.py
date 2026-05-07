@@ -119,7 +119,12 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
 
     # ----- branches that need a data probe ----------------------------- #
     if t.startswith('TIMESTAMP'):
-        return d.format_timestamp(_probe_timestamp(c, qtable, qcol))
+        info = _probe_timestamp(c, qtable, qcol)
+        # Every value sits at midnight – render as DATE rather than padding
+        # the column with `00:00:00` time components on every row.
+        if info.midnight_only:
+            return d.format_date()
+        return d.format_timestamp(info)
     if t == 'BLOB':
         return d.format_binary(_probe_blob_len(c, qtable, qcol))
 
@@ -136,10 +141,14 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
         return _render_numeric(c, qtable, qcol, d)
 
     if t == 'VARCHAR':
-        suggested, _fmt = _varchar_type_suggestion(qtable, col_name)
+        suggested, _fmt, _via_ts = _varchar_type_suggestion(qtable, col_name)
         if suggested:
             up = suggested.upper()
-            if up == 'BOOLEAN':     return d.format_boolean()
+            if up == 'BOOLEAN':
+                if (not getattr(d, 'boolean_accepts_yes_no', True)
+                        and not _has_only_strict_boolean_values(c, qtable, qcol)):
+                    return d.format_string(_probe_string(c, qtable, qcol))
+                return d.format_boolean()
             if up == 'DATE':        return d.format_date()
             if up == 'TIMESTAMP':
                 return d.format_timestamp(_probe_timestamp(c, qtable, qcol))
@@ -154,7 +163,9 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
 
 
 def _render_int_typed(c, qtable: str, qcol: str, d: Dialect) -> str:
-    """Return the narrowest integer type for an already-typed integer column."""
+    """Fast path for typed integer columns. The source type has already
+    validated the values, so only the range is needed to choose the
+    narrowest integer type."""
     with instrument.timed('_render_int_typed', col=qcol):
         row = c.execute(f"""
             select  min({qcol})
@@ -288,24 +299,33 @@ def _narrowest_int_via_string(c, qtable: str, qcol: str) -> tuple[int, int] | No
 
 
 def _probe_timestamp(c, qtable: str, qcol: str) -> TimestampResult:
-    """Whether the column needs sub-millisecond precision and whether
-    any value precedes 1753-01-01.  SQL Server cares about both;
-    DuckDB / Postgres don't (their `timestamp` covers everything)."""
+    """Whether the column needs sub-millisecond precision, whether any
+    value precedes 1753-01-01, and whether every value sits at midnight.
+    SQL Server cares about the first two for the datetime / datetime2
+    split; the midnight flag lets the caller downgrade to DATE."""
     with instrument.timed('_probe_timestamp', col=qcol):
         row = c.execute(f"""
-            select  min(try_cast({qcol} as timestamp))     as mn
+            select  min(try_cast({qcol} as timestamp))                          as mn
             ,       max(extract(microsecond from try_cast({qcol} as timestamp))) as mx_us
+            ,       sum(case when try_cast({qcol} as timestamp) is not null
+                              and date_trunc('day', try_cast({qcol} as timestamp))
+                                  <> try_cast({qcol} as timestamp)
+                         then 1 else 0 end)                                      as with_time
+            ,       count({qcol})                                                as n
             from    {qtable}
             where   {qcol} is not null
             ;
         """).fetchone()
     if row is None or row[0] is None:
-        return TimestampResult(needs_subsecond=False, pre_1753=False)
+        return TimestampResult(needs_subsecond=False, pre_1753=False, midnight_only=False)
     mn = str(row[0])
     mx_us = int(row[1] or 0)
+    with_time = int(row[2] or 0)
+    n = int(row[3] or 0)
     return TimestampResult(
         needs_subsecond=(mx_us % 1000) != 0,
         pre_1753=(mn < _DATETIME_FLOOR),
+        midnight_only=(n > 0 and with_time == 0),
     )
 
 
@@ -339,7 +359,24 @@ def _probe_string(c, qtable: str, qcol: str) -> StringResult:
     return StringResult(min_len=min_len, max_len=max_len, fixed=(min_len == max_len))
 
 
-def _varchar_type_suggestion(qtable: str, col_name: str) -> tuple[str | None, str | None]:
+def _has_only_strict_boolean_values(c, qtable: str, qcol: str) -> bool:
+    """Whether every non-null VARCHAR value in the column is one of the
+    forms a strict BOOLEAN target accepts on insert: 0/1/true/false
+    (case-insensitive). Yes/No/Y/N pass DuckDB's permissive try_cast but
+    SQL Server's bit rejects them.
+    """
+    with instrument.timed('_has_only_strict_boolean_values', col=qcol):
+        row = c.execute(f"""
+            select  sum(case when lower({qcol}) in ('0', '1', 'true', 'false')
+                             then 0 else 1 end)
+            from    {qtable}
+            where   {qcol} is not null
+            ;
+        """).fetchone()
+    return int(row[0] or 0) == 0
+
+
+def _varchar_type_suggestion(qtable: str, col_name: str) -> tuple[str | None, str | None, bool]:
     """Run the Clone analyzer at the strict 100% threshold to pick
     the column's umbrella (BIGINT, DOUBLE, DECIMAL, DATE, TIMESTAMP,
     BOOLEAN); a single non-conforming value would break the export
