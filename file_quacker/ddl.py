@@ -154,7 +154,9 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
 
 
 def _render_int_typed(c, qtable: str, qcol: str, d: Dialect) -> str:
-    """Return the narrowest integer type for an already-typed integer column."""
+    """Fast path for typed integer columns. The source type has already
+    validated the values, so only the range is needed to choose the
+    narrowest integer type."""
     with instrument.timed('_render_int_typed', col=qcol):
         row = c.execute(f"""
             select  min({qcol})
@@ -195,26 +197,22 @@ def _render_numeric(c, qtable: str, qcol: str, d: Dialect) -> str:
 # --------------------------------------------------------------------------- #
 
 def _probe_numeric(c, qtable: str, qcol: str) -> NumericResult:
-    """Universal numeric probe.
+    """Pick a numeric type from the values in the column.
 
-    Steps:
-      1. Cast every non-null value to text.  Filter to plain decimal
-         literals (no scientific notation).
-      2. If no plain values, or a plain+scientific mix, return
-         ``fallback`` – caller / dialect picks a wide carrier.
-      3. Compute max integer-side digit count, the trimmed p90 scale,
-         and a `has_dot` flag (any value with a fractional part).
-         p90 (not max) keeps a single Excel-compute artifact like
-         ``3.66666666666667`` from inflating every row's scale.
-      4. If neither has_dot nor any trimmed scale, narrow to the
-         smallest int family that holds min/max; fall back to
-         ``decimal(P, 0)`` when values exceed bigint range.
-      5. Otherwise emit ``decimal(max_int + scale, scale)`` capped at
-         (38, 10), where scale = max(p90_trimmed, has_dot ? 1 : 0).
-         The has_dot floor preserves a column's decimal nature even
-         when every value is `.00`-padded – important for VARCHAR
-         exports (`nvarchar('5.00') → tinyint` would fail; →
-         `decimal(P, 1)` succeeds).
+    Casts each non-null value to text and keeps only plain decimal literals.
+    Anything with scientific notation, currency, or a leading zero is left
+    out and the column falls back to a wider carrier chosen by the dialect.
+
+    From the surviving values the probe takes the max integer-side digit
+    count, the max trimmed scale, and a `has_dot` flag. The source is
+    trusted as-is — Excel float artifacts are already cleaned up at ingest.
+
+    A column with no decimals narrows to the smallest int family that holds
+    its min/max; otherwise we emit `decimal(max_int + scale, scale)`. The
+    `has_dot` floor of 1 keeps `1.00`-padded columns from collapsing to int
+    and breaking a VARCHAR export bound to a narrow integer column. When
+    `max_int + scale` would exceed 38 we reduce scale first so the integer
+    side is preserved.
     """
     with instrument.timed('_probe_numeric', col=qcol):
         row = c.execute(f"""
@@ -230,16 +228,12 @@ def _probe_numeric(c, qtable: str, qcol: str) -> NumericResult:
                              else 0 end                                    as scl
                 ,       case when position('.' in s) > 0 then 1 else 0 end as has_dot
                 from    cte_strs
-                -- Leading-zero strings (e.g. "010876", "01234") aren't
-                -- numbers; they're identifiers that must round-trip as
-                -- text.  Excluding them here pushes the column to fallback
-                -- rendering, which the caller handles as varchar(N).
-                where   regexp_matches(s, '^[+-]?(0|[1-9]\\d*)(\\.\\d+)?$')
+                where   regexp_matches(s, '{derive.PLAIN_DECIMAL_RE}')
             )
             select  (select count(*) from cte_strs)   as n_total
             ,       count(*)                          as n_plain
             ,       max(ilen)                         as max_int
-            ,       quantile_disc(scl, 0.9)           as p90_scale
+            ,       max(scl)                          as max_scale
             ,       max(has_dot)                      as has_dot
             from    cte_parts
             ;
@@ -255,9 +249,10 @@ def _probe_numeric(c, qtable: str, qcol: str) -> NumericResult:
         return NumericResult(kind='fallback')
 
     max_int   = max(int(row[2] or 1), 1)
-    p90_trim  = min(int(row[3] or 0), 10)
+    max_scl   = int(row[3] or 0)
     has_dot   = int(row[4] or 0) == 1
-    scale     = max(p90_trim, 1 if has_dot else 0)
+    scale     = max(max_scl, 1 if has_dot else 0)
+    scale     = min(scale, max(0, 38 - max_int))
 
     if scale == 0:
         # Pure integer column; narrow on real bigint min/max.
