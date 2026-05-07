@@ -154,9 +154,7 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
 
 
 def _render_int_typed(c, qtable: str, qcol: str, d: Dialect) -> str:
-    """Fast path for typed integer columns. The source type has already
-    validated the values, so only the range is needed to choose the
-    narrowest integer type."""
+    """Return the narrowest integer type for an already-typed integer column."""
     with instrument.timed('_render_int_typed', col=qcol):
         row = c.execute(f"""
             select  min({qcol})
