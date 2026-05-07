@@ -46,10 +46,13 @@ class NumericResult:
 @dataclass(frozen=True)
 class TimestampResult:
     """Outcome of the timestamp probe.  The probe captures whether
-    pre-1753 dates are present (matters for SQL Server's ``datetime``)
-    and whether sub-millisecond precision is used."""
+    pre-1753 dates are present (matters for SQL Server's ``datetime``),
+    whether sub-millisecond precision is used, and whether every value
+    has its time component at midnight (lets the caller downgrade to
+    DATE)."""
     needs_subsecond: bool
     pre_1753: bool
+    midnight_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,11 @@ class Dialect(Protocol):
 
     id: str
     display_name: str
+    # When False, the BOOLEAN suggestion path runs an extra strict check on
+    # VARCHAR sources before emitting `format_boolean()` – DuckDB happily
+    # casts Yes/No/Y/N to bool, but SQL Server's bit only takes 0/1/true/
+    # false, so a Yes/No column passed through as bit fails on insert.
+    boolean_accepts_yes_no: bool = True
 
     def quote_ident(self, name: str) -> str: ...
 
