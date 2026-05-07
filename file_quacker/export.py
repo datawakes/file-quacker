@@ -21,6 +21,7 @@ from typing import Literal
 import pyodbc
 
 from . import db, ddl as ddl_mod
+from .export_file import _project, _string_columns
 from .export_source import ExportSource
 
 
@@ -58,6 +59,9 @@ class ExportOptions:
     table_name: str
     mappings: list[ColumnMapping] = field(default_factory=list)
     if_exists: Literal['fail', 'drop', 'append'] = 'fail'
+    # Strip leading / trailing whitespace from VARCHAR cells on the way out.
+    # Default on; non-string columns are unaffected.
+    trim_strings: bool = True
 
     def __post_init__(self):
         if isinstance(self.source, dict):
@@ -135,6 +139,18 @@ def _qident_ss(name: str) -> str:
     if _SAFE_IDENT.match(name):
         return name
     return '[' + name.replace(']', ']]') + ']'
+
+
+def _unique_target(base: str, taken: set[str]) -> str:
+    """Return ``base`` if free; otherwise ``base_1`` / ``base_2`` / ... until
+    a free name is found. Used to de-dupe target column names so SQL Server
+    doesn't reject the CREATE TABLE."""
+    if base not in taken:
+        return base
+    i = 1
+    while f'{base}_{i}' in taken:
+        i += 1
+    return f'{base}_{i}'
 
 
 def _to_snake_case(name: str) -> str:
@@ -258,6 +274,13 @@ def list_schemas(opts: ConnectionOptions) -> list[str]:
 def suggest_mappings(source: 'ExportSource | dict') -> list[dict]:
     """Per-column default mapping: target name = snake_case(source),
     type = ddl._sqlserver_type of the DuckDB column, nullable from data.
+
+    SQL Server (and most other RDBMSes) reject duplicate column names in
+    the same table, but snake-casing can collapse distinct source names
+    (`Foo`, `FOO`, `foo`) onto the same target. The first occurrence keeps
+    its name; subsequent ones get `_1`, `_2`, ... appended until unique.
+    Suffix collisions with later sources cascade through the same scheme,
+    so `[foo, foo, foo_1]` resolves to `[foo, foo_1, foo_1_1]`.
     """
     if isinstance(source, dict):
         source = ExportSource(**source)
@@ -270,6 +293,7 @@ def suggest_mappings(source: 'ExportSource | dict') -> list[dict]:
             ;
         """).fetchall()
         out: list[dict] = []
+        taken: set[str] = set()
         for row in rows:
             name = row[1]
             if name == '_src_row_num':
@@ -277,10 +301,12 @@ def suggest_mappings(source: 'ExportSource | dict') -> list[dict]:
             duck_type = row[2]
             sql_type = ddl_mod._sqlserver_type(c, qtable, name, duck_type)
             nullable = ddl_mod._has_nulls(c, qtable, name)
+            target = _unique_target(_to_snake_case(name), taken)
+            taken.add(target)
             out.append({
                 'source': name,
                 'source_type': duck_type,
-                'target': _to_snake_case(name),
+                'target': target,
                 'sql_type': sql_type,
                 'nullable': nullable,
             })
@@ -335,10 +361,13 @@ def export_to_sqlserver(conn_opts: ConnectionOptions, exp: ExportOptions) -> dic
     _reset_progress()
     _set_progress(phase='connecting')
 
-    src_cols = [db.quote_ident(m.source) for m in exp.mappings]
-    src_select = ', '.join(src_cols)
     source_name, source_cleanup = exp.source.materialize()
     qsource = db.quote_ident(source_name)
+    str_cols = _string_columns(qsource) if exp.trim_strings else set()
+    src_select = ', '.join(
+        _project(m.source, m.source in str_cols, exp.trim_strings)
+        for m in exp.mappings
+    )
     (total_rows,) = db.conn().execute(f"""
         select  count(*)
         from    {qsource}
@@ -601,18 +630,32 @@ def _bsearch_range(cursor, insert_q: str, chunk: list,
 def _describe_error_row(row_num: int, row, mappings: list[ColumnMapping],
                         error: str) -> dict:
     marked = _mark_offending_columns(row, mappings, error)
+    msg = error.splitlines()[0] if error else ''
+    # Annotate the message with repr() of each marked column's value.
+    # Hidden characters (BOM, NBSP, control chars, trailing whitespace)
+    # are invisible in the raw string but obvious in repr — surfacing
+    # them here saves the user from running their own ad-hoc query when
+    # the SQL Server error doesn't already include the value.
+    if marked:
+        by_target = {m.target: v for m, v in zip(mappings, row)}
+        annots = [f'{col}={by_target.get(col)!r}' for col in marked]
+        if annots:
+            msg = f'{msg} · {", ".join(annots)}'
     return {
         'row': row_num,
         'marked': marked,
         'values': _values_as_dict(row, mappings),
-        'message': error.splitlines()[0] if error else '',
+        'message': msg,
     }
 
 
 def _mark_offending_columns(row, mappings: list[ColumnMapping],
                             error: str) -> list[str]:
     """Parse SQL Server error text for known patterns that name the column
-    or show the offending value."""
+    or show the offending value. Falls back to a per-column parse check
+    when SQL Server's message is too terse to identify the offender on
+    its own (e.g. error 8114, 'Error converting data type nvarchar to
+    numeric', which doesn't name the column or include the value)."""
     marked: set[str] = set()
     col_match = re.search(r"column '([^']+)'", error)
     if col_match:
@@ -629,7 +672,61 @@ def _mark_offending_columns(row, mappings: list[ColumnMapping],
             vs = '' if v is None else str(v)
             if vs == hit_value or (hit_value and vs.startswith(hit_value)):
                 marked.add(m.target)
+
+    # Fallback: error names a conversion failure but didn't include the
+    # offending value, so the regex above couldn't locate the column.
+    # Walk the row and flag any numeric-target column whose value
+    # doesn't parse as the destination type.
+    if not marked and 'converting data type' in error.lower():
+        marked.update(_columns_failing_target_cast(row, mappings))
+
     return sorted(marked)
+
+
+_NUMERIC_TARGET_RE = re.compile(
+    r'^\s*(int|bigint|tinyint|smallint|decimal|numeric|float|real|money|smallmoney)\b',
+    re.IGNORECASE,
+)
+
+
+def _columns_failing_target_cast(row, mappings: list[ColumnMapping]) -> list[str]:
+    """Best-effort offender detection for numeric-conversion errors that
+    SQL Server reports without naming the column. For each mapping with
+    a numeric target, parse the row's value the same way SQL Server's
+    bit / int / decimal cast would and return the columns that fail."""
+    out: list[str] = []
+    for m, v in zip(mappings, row):
+        if v is None:
+            continue
+        if not _NUMERIC_TARGET_RE.match(m.sql_type or ''):
+            continue
+        if not _value_parses_as_numeric(m.sql_type, v):
+            out.append(m.target)
+    return out
+
+
+def _value_parses_as_numeric(sql_type: str, v: object) -> bool:
+    """Whether ``v`` parses cleanly as the target SQL Server numeric
+    type. Mirrors the cases the bind layer's nvarchar→numeric cast
+    would fail on (non-numeric text, comma thousand separators, etc.)."""
+    s = str(v).strip()
+    if not s:
+        return False
+    t = sql_type.lower()
+    try:
+        if t.startswith(('decimal', 'numeric', 'money', 'smallmoney')):
+            from decimal import Decimal
+            Decimal(s)
+            return True
+        if t.startswith(('float', 'real')):
+            float(s)
+            return True
+        if t.startswith(('int', 'bigint', 'tinyint', 'smallint')):
+            int(s)
+            return True
+    except Exception:
+        return False
+    return True
 
 
 def _values_as_dict(row, mappings: list[ColumnMapping]) -> dict:
