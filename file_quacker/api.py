@@ -461,8 +461,9 @@ class Api:
     def list_sqlserver_schemas(self, conn_opts: dict) -> list[str]:
         return export_mod.list_schemas(export_mod.ConnectionOptions(**conn_opts))
 
-    def suggest_export_mappings(self, source: dict) -> list[dict]:
-        return export_mod.suggest_mappings(source)
+    def suggest_export_mappings(self, source: dict,
+                                trim_strings: bool = True) -> list[dict]:
+        return export_mod.suggest_mappings(source, trim_strings)
 
     def preview_export_ddl(self, export_opts: dict) -> dict:
         return {'sql': export_mod.preview_ddl(export_mod.ExportOptions(**export_opts))}

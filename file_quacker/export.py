@@ -272,7 +272,8 @@ def list_schemas(opts: ConnectionOptions) -> list[str]:
 # Mapping + DDL preview                                                       #
 # --------------------------------------------------------------------------- #
 
-def suggest_mappings(source: 'ExportSource | dict') -> list[dict]:
+def suggest_mappings(source: 'ExportSource | dict',
+                     trim_strings: bool = True) -> list[dict]:
     """Per-column default mapping: target name = snake_case(source),
     type = ddl._sqlserver_type of the DuckDB column, nullable from data.
 
@@ -282,6 +283,10 @@ def suggest_mappings(source: 'ExportSource | dict') -> list[dict]:
     its name; subsequent ones get `_1`, `_2`, ... appended until unique.
     Suffix collisions with later sources cascade through the same scheme,
     so `[foo, foo, foo_1]` resolves to `[foo, foo_1, foo_1_1]`.
+
+    ``trim_strings`` defaults to True to match the export dialog's default;
+    string columns get sized from their trimmed lengths so a downstream
+    char(N) target won't pad whitespace back into the values.
     """
     if isinstance(source, dict):
         source = ExportSource(**source)
@@ -300,7 +305,7 @@ def suggest_mappings(source: 'ExportSource | dict') -> list[dict]:
             if name == '_src_row_num':
                 continue
             duck_type = row[2]
-            sql_type = ddl_mod._sqlserver_type(c, qtable, name, duck_type)
+            sql_type = ddl_mod._sqlserver_type(c, qtable, name, duck_type, trim_strings)
             nullable = ddl_mod._has_nulls(c, qtable, name)
             target = _unique_target(_to_snake_case(name), taken)
             taken.add(target)
