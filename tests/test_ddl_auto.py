@@ -56,6 +56,47 @@ def test_ddl_renders_date_for_typed_timestamp_all_midnight():
     assert 'date' in ddl_duck and 'timestamp' not in ddl_duck
 
 
+def test_string_columns_sized_from_trimmed_lengths_when_trim_on():
+    """A column of uniformly-padded values used to size as char(N) on the
+    raw length, then SQL Server's char padding put the whitespace right
+    back as trailing spaces. The probe now respects the trim flag and
+    sizes from trimmed lengths so the destination column actually fits
+    the trimmed values."""
+    p = Path(tempfile.gettempdir()) / 'fq_trim_size.csv'
+    p.write_text(
+        'flag,note\n'
+        ' Y N , abc \n'
+        ' Y N , def \n'
+        ' Y N , ghi \n',
+        encoding='utf-8',
+    )
+    r = ingest.load_file(str(p))
+    api = Api()
+    src = {'kind': 'table', 'name': r.name, 'sql': None}
+    trimmed = {m['source']: m['sql_type'] for m in api.suggest_export_mappings(src, True)}
+    raw = {m['source']: m['sql_type'] for m in api.suggest_export_mappings(src, False)}
+    assert trimmed['flag'] == 'char(3)'  # 'Y N' after trim
+    assert trimmed['note'] == 'char(3)'  # 'abc'/'def'/'ghi' after trim
+    assert raw['flag'] == 'char(5)'      # ' Y N '
+    assert raw['note'] == 'char(5)'      # ' abc '/' def '/' ghi '
+
+
+def test_string_columns_with_trailing_newlines_size_correctly_after_trim():
+    """Reported case: source values end in \\r\\n and the column got
+    sized to char(N) including the newline length, then SQL Server
+    padded the trimmed values back to N with spaces."""
+    p = Path(tempfile.gettempdir()) / 'fq_trim_newline.csv'
+    p.write_text(
+        'code\n"abc\r\n"\n"def\r\n"\n"ghi\r\n"\n',
+        encoding='utf-8',
+    )
+    r = ingest.load_file(str(p))
+    api = Api()
+    src = {'kind': 'table', 'name': r.name, 'sql': None}
+    trimmed = {m['source']: m['sql_type'] for m in api.suggest_export_mappings(src, True)}
+    assert trimmed['code'] == 'char(3)'
+
+
 def test_alphanumeric_outlier_at_scale_falls_through_to_varchar():
     """At ~100k rows, one stray alphanumeric value gives 99.999% numeric
     coverage. Plain percentage rounding would push that up to 100.0 and
