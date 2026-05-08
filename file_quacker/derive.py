@@ -56,6 +56,13 @@ PLAIN_DECIMAL_RE = r'^-?(0|[1-9]\d*)(\.\d+)?$'
 # get rewritten to plain decimal alongside the other numeric cells.
 SNAPPABLE_NUMERIC_RE = r'^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$'
 
+
+def has_time_sql(ts_expr: str) -> str:
+    """SQL fragment that's true when ``ts_expr`` produces a non-midnight
+    timestamp. Used by the type probes (raw + cascade) to count values
+    whose time component would be lost on a DATE downgrade."""
+    return f"date_trunc('day', {ts_expr}) <> {ts_expr}"
+
 # (format, kind) ordered for correct precedence:
 #
 #   * Time-bearing formats first; they're more specific than
@@ -225,10 +232,10 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
     raw_ts_sql   = f"sum(case when try_cast({qcol} as timestamp) is not null then 1 else 0 end)"
     # Counts timestamps whose time component isn't midnight. When this is
     # 0 and raw_ts > 0, the column can be downgraded to DATE.
+    _raw_ts_expr = f'try_cast({qcol} as timestamp)'
     raw_ts_with_time_sql = (
-        f"sum(case when try_cast({qcol} as timestamp) is not null"
-        f"          and date_trunc('day', try_cast({qcol} as timestamp))"
-        f"              <> try_cast({qcol} as timestamp)"
+        f"sum(case when {_raw_ts_expr} is not null"
+        f"          and {has_time_sql(_raw_ts_expr)}"
         f"     then 1 else 0 end)"
     )
 
@@ -561,11 +568,8 @@ def _detect_date_format_single(
     """
     safe_fmt = fmt.replace(chr(39), chr(39) * 2)
     if kind == 'TIMESTAMP':
-        with_time_expr = (
-            f"sum(case when date_trunc('day', try_strptime({qcol}, '{safe_fmt}'))"
-            f"          <> try_strptime({qcol}, '{safe_fmt}')"
-            f"     then 1 else 0 end)"
-        )
+        ts_expr = f"try_strptime({qcol}, '{safe_fmt}')"
+        with_time_expr = f"sum(case when {has_time_sql(ts_expr)} then 1 else 0 end)"
     else:
         with_time_expr = "0"
     try:
@@ -614,8 +618,7 @@ def _detect_date_format(
                             else 'unparseable'
                         end as detected
                     ,       case when try_cast({qcol} as timestamp) is not null
-                                  and date_trunc('day', try_cast({qcol} as timestamp))
-                                      <> try_cast({qcol} as timestamp)
+                                  and {has_time_sql(f'try_cast({qcol} as timestamp)')}
                              then 1 else 0 end as with_time
                     from    {qtable}
                     where   {qcol} is not null
