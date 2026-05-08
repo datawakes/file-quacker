@@ -168,6 +168,10 @@ export interface CastSuggestion {
   /** Set when the suggested DATE / TIMESTAMP uses a non-ISO format and
    *  therefore needs `try_strptime(col, fmt)` on the cast side. */
   detected_date_format: string | null
+  /** Set when a midnight-only TIMESTAMP column is being downgraded to
+   *  DATE with no format. The cast goes through TIMESTAMP first so the
+   *  source's time component doesn't trip DuckDB's date parser. */
+  via_timestamp?: boolean
 }
 
 export interface CastSpec {
@@ -176,6 +180,7 @@ export interface CastSpec {
   cast_to: string | null
   strict?: boolean
   date_format?: string | null
+  via_timestamp?: boolean
 }
 
 export interface DerivePreview {
@@ -256,6 +261,9 @@ export interface SqlServerExportOptions {
   table_name: string
   mappings: ExportColumnMapping[]
   if_exists: 'fail' | 'drop' | 'append'
+  /** Strip leading / trailing whitespace from VARCHAR cells on the way out.
+   *  Default on; non-string columns are unaffected. */
+  trim_strings?: boolean
 }
 
 export interface ExportMappingSuggestion extends ExportColumnMapping {
@@ -362,7 +370,7 @@ interface PywebviewApi {
   ): Promise<ExportResult>
   cancel_export(): Promise<{ cancelled: boolean }>
   get_export_progress(): Promise<ExportProgress>
-  export_to_file(source: ExportSource, target: FileTarget, mappings?: ExportColumnMapping[]): Promise<FileExportResult>
+  export_to_file(source: ExportSource, target: FileTarget, mappings?: ExportColumnMapping[], trim_strings?: boolean): Promise<FileExportResult>
   get_file_export_progress(): Promise<ExportProgress>
   cancel_file_export(): Promise<{ cancelled: boolean }>
   list_dialects(): Promise<{ id: string; display_name: string }[]>
@@ -404,7 +412,7 @@ function waitForApi(): Promise<PywebviewApi> {
     }
     window.addEventListener('pywebviewready', onReady, { once: true })
     setTimeout(() => {
-      if (!cached) reject(new Error('Not running inside pywebview; window.pywebview was not injected'))
+      if (!cached) reject(new Error('Not running inside pywebview — window.pywebview was not injected'))
     }, 3000)
   })
   return pending
@@ -462,8 +470,8 @@ export const cancelExport            = ()                                 => wit
 export const getExportProgress       = ()                                 => withApi(a => a.get_export_progress())
 
 // --- File export --------------------------------------------- //
-export const exportToFile          = (src: ExportSource, t: FileTarget, mappings?: ExportColumnMapping[]) =>
-  withApi(a => a.export_to_file(src, t, mappings))
+export const exportToFile          = (src: ExportSource, t: FileTarget, mappings?: ExportColumnMapping[], trimStrings?: boolean) =>
+  withApi(a => a.export_to_file(src, t, mappings, trimStrings))
 export const getFileExportProgress = ()                                  => withApi(a => a.get_file_export_progress())
 export const cancelFileExport      = ()                                  => withApi(a => a.cancel_file_export())
 
