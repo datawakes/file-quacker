@@ -191,6 +191,36 @@ def test_export_flat_trim_only_touches_string_columns():
     assert rows[2] == '2|2.75'
 
 
+def test_export_flat_trim_promotes_all_whitespace_to_null():
+    """A cell that's nothing but whitespace lands as NULL in the output,
+    matching how a truly-empty cell already behaves. Without this,
+    quoted-whitespace cells would land as empty strings while unquoted-
+    empty cells (already NULL in DuckDB) would land as NULL — confusing
+    inconsistency for the user looking at the destination table."""
+    src = _write_csv(
+        'fq_trim_blank_null.csv',
+        'id,note\n'
+        '1,"                         "\n'
+        '2,real value\n'
+        '3,\n',
+    )
+    r = ingest.load_file(str(src))
+    source = {'kind': 'table', 'name': r.name, 'sql': None}
+
+    out = Path(tempfile.gettempdir()) / 'fq_trim_blank_null.txt'
+    out.unlink(missing_ok=True)
+    res = Api().export_to_file(source, {
+        'kind': 'flat', 'path': str(out),
+        'delimiter': '|', 'header': True, 'quote': '"', 'null': 'NULL',
+    })
+    assert res['ok']
+    rows = out.read_text(encoding='utf-8').splitlines()
+    # All-whitespace cell promoted to NULL, matches the unquoted-empty row.
+    assert rows[1] == '1|NULL'
+    assert rows[2] == '2|real value'
+    assert rows[3] == '3|NULL'
+
+
 def test_export_parquet_trim_default_on():
     src = _write_csv(
         'fq_trim_pq_src.csv',
