@@ -75,10 +75,13 @@ def _string_columns(qtable: str) -> set[str]:
 
 def _project(source: str, is_string: bool, trim_strings: bool) -> str:
     """SELECT expression for one source column. String columns get wrapped
-    in regexp_replace when trim is on; everything else is the bare ident."""
+    in regexp_replace when trim is on; an empty result is then promoted
+    to NULL via nullif so a 25-spaces cell lands as NULL rather than as
+    an empty string – consistent with how a truly-empty cell already
+    behaves on the source side. Non-string columns are the bare ident."""
     qident = db.quote_ident(source)
     if trim_strings and is_string:
-        return f"regexp_replace({qident}, '{WS_TRIM_PATTERN}', '', 'g')"
+        return f"nullif(regexp_replace({qident}, '{WS_TRIM_PATTERN}', '', 'g'), '')"
     return qident
 
 
