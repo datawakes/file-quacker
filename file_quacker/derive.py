@@ -56,6 +56,13 @@ PLAIN_DECIMAL_RE = r'^-?(0|[1-9]\d*)(\.\d+)?$'
 # get rewritten to plain decimal alongside the other numeric cells.
 SNAPPABLE_NUMERIC_RE = r'^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$'
 
+
+def has_time_sql(ts_expr: str) -> str:
+    """SQL fragment that's true when ``ts_expr`` produces a non-midnight
+    timestamp. Used by the type probes (raw + cascade) to count values
+    whose time component would be lost on a DATE downgrade."""
+    return f"date_trunc('day', {ts_expr}) <> {ts_expr}"
+
 # (format, kind) ordered for correct precedence:
 #
 #   * Time-bearing formats first; they're more specific than
@@ -111,6 +118,10 @@ class CastSpec:
     # Only relevant when cast_to is DATE / TIMESTAMP for a non-ISO
     # value – triggers `try_strptime(col, fmt)` instead of `try_cast`.
     date_format: str | None = None
+    # Set when downgrading a midnight-only TIMESTAMP column to DATE with
+    # no format. The cast goes through TIMESTAMP first so DuckDB's strict
+    # YYYY-MM-DD date parser doesn't reject values like '2024-01-15 00:00:00'.
+    via_timestamp: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -146,7 +157,7 @@ def suggest_casts(table_name: str) -> list[dict]:
             continue
 
         analysis = analyses[name]
-        suggested, fmt = _pick_suggestion(analysis)
+        suggested, fmt, via_ts = _pick_suggestion(analysis)
         out.append({
             'source': name,
             'source_type': src_type,
@@ -154,6 +165,7 @@ def suggest_casts(table_name: str) -> list[dict]:
             'cast_coverage': analysis['coverage'],
             'sample_values': sample,
             'detected_date_format': fmt,
+            'via_timestamp': via_ts,
         })
     return out
 
@@ -218,6 +230,14 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
     raw_date_sql = (f"sum(case when try_cast({qcol} as date) is not null"
                     f"          and cast(try_cast({qcol} as date) as varchar) = {qcol} then 1 else 0 end)")
     raw_ts_sql   = f"sum(case when try_cast({qcol} as timestamp) is not null then 1 else 0 end)"
+    # Counts timestamps whose time component isn't midnight. When this is
+    # 0 and raw_ts > 0, the column can be downgraded to DATE.
+    _raw_ts_expr = f'try_cast({qcol} as timestamp)'
+    raw_ts_with_time_sql = (
+        f"sum(case when {_raw_ts_expr} is not null"
+        f"          and {has_time_sql(_raw_ts_expr)}"
+        f"     then 1 else 0 end)"
+    )
 
     # Pass 1: coverage.
     # When the sniff finds no type candidates, a bare count(*) is enough.
@@ -230,25 +250,39 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
             """).fetchone()
         non_null = int(nn or 0)
         ok_int = ok_dec = ok_double = ok_bool = ok_raw_date = ok_raw_ts = 0
+        ok_raw_ts_with_time = 0
     else:
         with instrument.timed('coverage_pass', col=col_name, umbrellas=n_active):
             row = c.execute(f"""
-                select  count({qcol})                       as non_null
-                ,       {_expr(skip_int,      int_sql)}     as ok_int
-                ,       {_expr(skip_dec,      dec_sql)}     as ok_dec
-                ,       {_expr(skip_double,   double_sql)}  as ok_double
-                ,       {_expr(skip_bool,     bool_sql)}    as ok_bool
-                ,       {_expr(skip_raw_date, raw_date_sql)} as ok_raw_date
-                ,       {_expr(skip_raw_ts,   raw_ts_sql)}  as ok_raw_ts
+                select  count({qcol})                                 as non_null
+                ,       {_expr(skip_int,      int_sql)}               as ok_int
+                ,       {_expr(skip_dec,      dec_sql)}               as ok_dec
+                ,       {_expr(skip_double,   double_sql)}            as ok_double
+                ,       {_expr(skip_bool,     bool_sql)}              as ok_bool
+                ,       {_expr(skip_raw_date, raw_date_sql)}          as ok_raw_date
+                ,       {_expr(skip_raw_ts,   raw_ts_sql)}            as ok_raw_ts
+                ,       {_expr(skip_raw_ts,   raw_ts_with_time_sql)}  as ok_raw_ts_with_time
                 from    {qtable}
                 ;
             """).fetchone()
-        non_null, ok_int, ok_dec, ok_double, ok_bool, ok_raw_date, ok_raw_ts = (
+        (non_null, ok_int, ok_dec, ok_double, ok_bool,
+         ok_raw_date, ok_raw_ts, ok_raw_ts_with_time) = (
             int(v or 0) for v in row
         )
 
     def pct(v: int) -> float:
-        return round((v / non_null * 100.0), 2) if non_null else 0.0
+        # 100.0 only when every non-null value matches; 0.0 only when none do.
+        # Without this clamp, plain rounding pushes 99.999% (one stray value
+        # in 100k rows) up to 100.0 and the STRICT_THRESHOLD check thinks
+        # the column is fully numeric – which is exactly how an alphanumeric
+        # outlier slips through and lands as decimal(38,10) at export time.
+        if not non_null:
+            return 0.0
+        if v >= non_null:
+            return 100.0
+        if v <= 0:
+            return 0.0
+        return min(99.99, round(v / non_null * 100.0, 2))
 
     raw_date_pct = pct(ok_raw_date)
     raw_ts_pct   = pct(ok_raw_ts)
@@ -278,6 +312,7 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
     cnt = 0
     kind: str | None = None
     fmt: str | None = None
+    cascade_with_time = 0
     raw_ok = raw_date_pct >= SUGGEST_THRESHOLD or raw_ts_pct >= SUGGEST_THRESHOLD
     numeric_ok = (
         int_pct    >= SUGGEST_THRESHOLD
@@ -286,15 +321,23 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
     )
     if non_null and not raw_ok and not numeric_ok:
         if sn == 0:
-            cnt, kind, fmt = _detect_date_format(c, qtable, qcol)
+            cnt, kind, fmt, cascade_with_time = _detect_date_format(c, qtable, qcol)
         elif sniff['cascade_fmt'] is not None:
-            cnt, kind, fmt = _detect_date_format_single(
+            cnt, kind, fmt, cascade_with_time = _detect_date_format_single(
                 c, qtable, qcol, sniff['cascade_fmt'], sniff['cascade_kind'],
             )
     cascade_pct = pct(cnt)
 
     date_pct = max(raw_date_pct, cascade_pct if kind == 'DATE'      else 0.0)
     ts_pct   = max(raw_ts_pct,   cascade_pct if kind == 'TIMESTAMP' else 0.0)
+
+    # All-midnight detection. Only meaningful when timestamps are involved.
+    # Combines the raw-cast and cascade probes so either path can downgrade.
+    raw_all_midnight = ok_raw_ts > 0 and ok_raw_ts_with_time == 0
+    cascade_all_midnight = (
+        kind == 'TIMESTAMP' and cnt > 0 and cascade_with_time == 0
+    )
+    all_midnight = raw_all_midnight or cascade_all_midnight
 
     return {
         'coverage': {
@@ -315,6 +358,7 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
         'cascade_pct':       cascade_pct,
         'cascade_kind':      kind,
         'cascade_format':    fmt,
+        'all_midnight':      all_midnight,
         'non_null':          non_null,
     }
 
@@ -322,48 +366,63 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
 def _pick_suggestion(
     a: dict,
     threshold: float = SUGGEST_THRESHOLD,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, bool]:
     """Pick the umbrella type that ≥ ``threshold`` percent of the
     column's non-null values fit cleanly.  Pass STRICT_THRESHOLD when
     even a single non-conforming value would break the downstream
     operation (SQL Server bind, etc.); the lenient default is fine for
-    the Clone dialog where the user reviews the suggestion."""
-    cov         = a['coverage']
-    raw_date    = a.get('raw_date_pct', 0.0)
-    raw_ts      = a.get('raw_ts_pct',   0.0)
-    cascade     = a.get('cascade_pct',  0.0)
+    the Clone dialog where the user reviews the suggestion.
+
+    Returns ``(type, format, via_timestamp)``. The ``via_timestamp`` flag
+    is set when a midnight-only TIMESTAMP column is being downgraded to
+    DATE with no format – the cast needs to go through TIMESTAMP first.
+    """
+    cov          = a['coverage']
+    raw_date     = a.get('raw_date_pct', 0.0)
+    raw_ts       = a.get('raw_ts_pct',   0.0)
+    cascade      = a.get('cascade_pct',  0.0)
     cascade_kind = a.get('cascade_kind')
     cascade_fmt  = a.get('cascade_format')
+    midnight     = bool(a.get('all_midnight', False))
 
     if cov.get('BIGINT', 0.0) >= threshold:
-        return 'BIGINT', None
+        return 'BIGINT', None, False
 
     if cov.get('DECIMAL', 0.0) >= threshold and a.get('decimal_precision'):
         p, s = a['decimal_precision'], a['decimal_scale']
-        return f'DECIMAL({p},{s})', None
+        return f'DECIMAL({p},{s})', None, False
 
     if cov.get('DOUBLE', 0.0) >= threshold:
-        return 'DOUBLE', None
+        return 'DOUBLE', None, False
 
     # DATE / TIMESTAMP – raw cast first (no format needed); fall back
     # to the non-ISO cascade format only when raw alone doesn't clear
     # the threshold.
     if cov.get('DATE', 0.0) >= threshold:
         if raw_date >= threshold:
-            return 'DATE', None
+            return 'DATE', None, False
         if cascade >= threshold and cascade_kind == 'DATE':
-            return 'DATE', (None if cascade_fmt in _ISO_CAST_FORMATS else cascade_fmt)
+            return 'DATE', (None if cascade_fmt in _ISO_CAST_FORMATS else cascade_fmt), False
 
     if cov.get('TIMESTAMP', 0.0) >= threshold:
+        # Midnight-only timestamps downgrade to DATE. Keep the cascade
+        # format when present (strptime → cast(date) drops the time);
+        # for raw ISO timestamps, signal via_timestamp so the cast goes
+        # through TIMESTAMP first.
         if raw_ts >= threshold:
-            return 'TIMESTAMP', None
+            if midnight:
+                return 'DATE', None, True
+            return 'TIMESTAMP', None, False
         if cascade >= threshold and cascade_kind == 'TIMESTAMP':
-            return 'TIMESTAMP', (None if cascade_fmt in _ISO_CAST_FORMATS else cascade_fmt)
+            fmt_out = None if cascade_fmt in _ISO_CAST_FORMATS else cascade_fmt
+            if midnight:
+                return 'DATE', fmt_out, fmt_out is None
+            return 'TIMESTAMP', fmt_out, False
 
     if cov.get('BOOLEAN', 0.0) >= threshold:
-        return 'BOOLEAN', None
+        return 'BOOLEAN', None, False
 
-    return None, None
+    return None, None, False
 
 
 # Reusable date-format probes for the sniff sample.
@@ -500,36 +559,45 @@ def _detect_date_format_single(
     qcol: str,
     fmt: str,
     kind: str,
-) -> tuple[int, str | None, str | None]:
+) -> tuple[int, str | None, str | None, int]:
     """Verify only the sample-winning date format against the full column.
 
-    This avoids rerunning the full date-format cascade when the sniff already
-    found the likely format.
+    Returns ``(match_count, kind, format, with_time_count)`` where the
+    last element counts cascade hits whose time component isn't midnight.
+    Always 0 when ``kind`` is DATE; only meaningful for TIMESTAMP.
     """
     safe_fmt = fmt.replace(chr(39), chr(39) * 2)
+    if kind == 'TIMESTAMP':
+        ts_expr = f"try_strptime({qcol}, '{safe_fmt}')"
+        with_time_expr = f"sum(case when {has_time_sql(ts_expr)} then 1 else 0 end)"
+    else:
+        with_time_expr = "0"
     try:
         with instrument.timed('_detect_date_format_single', col=qcol, fmt=fmt):
             row = c.execute(f"""
-                select  count(*)
+                select  count(*)        as cnt
+                ,       {with_time_expr} as with_time
                 from    {qtable}
                 where   {qcol} is not null
                 and     try_strptime({qcol}, '{safe_fmt}') is not null
                 ;
             """).fetchone()
     except duckdb.Error:
-        return 0, None, None
+        return 0, None, None, 0
     if not row or row[0] is None:
-        return 0, None, None
-    return int(row[0]), kind, fmt
+        return 0, None, None, 0
+    return int(row[0]), kind, fmt, int(row[1] or 0)
 
 
 def _detect_date_format(
     c,
     qtable: str,
     qcol: str,
-) -> tuple[int, str | None, str | None]:
+) -> tuple[int, str | None, str | None, int]:
     """Find the majority non-ISO date format across date-like values.
-    Returns `(match_count, 'DATE'|'TIMESTAMP', format_string)`."""
+    Returns ``(match_count, 'DATE'|'TIMESTAMP', format_string, with_time_count)``
+    where ``with_time_count`` is the count of timestamp hits whose time
+    component isn't midnight. Always 0 for DATE results."""
     # Defensive escape: DATE_FORMATS today contains no `'` but a future
     # entry that did would be a SQL-injection vector here.
     case_lines = [
@@ -542,12 +610,16 @@ def _detect_date_format(
         with instrument.timed('_detect_date_format', col=qcol, formats=len(DATE_FORMATS)):
             row = c.execute(f"""
                 select  detected
-                ,       count(*) as cnt
+                ,       count(*)     as cnt
+                ,       sum(with_time) as with_time
                 from (
                     select  case
                         {case_block}
                             else 'unparseable'
                         end as detected
+                    ,       case when try_cast({qcol} as timestamp) is not null
+                                  and {has_time_sql(f'try_cast({qcol} as timestamp)')}
+                             then 1 else 0 end as with_time
                     from    {qtable}
                     where   {qcol} is not null
                     and     regexp_matches({qcol}, '{_DATE_LIKE_RE}')
@@ -558,14 +630,14 @@ def _detect_date_format(
                 ;
             """).fetchone()
     except duckdb.Error:
-        return 0, None, None
+        return 0, None, None, 0
     if not row:
-        return 0, None, None
-    detected, cnt = row
+        return 0, None, None, 0
+    detected, cnt, with_time = row
     if detected == 'unparseable':
-        return 0, None, None
+        return 0, None, None, 0
     fmt, kind = detected.split('|')
-    return int(cnt), kind, fmt
+    return int(cnt), kind, fmt, int(with_time or 0)
 
 
 def _sample(c, qtable: str, qcol: str, n: int = 3) -> list[str]:
@@ -601,15 +673,16 @@ def auto_derive(source_table: str, new_name: str) -> dict:
         name = row[1]
         src_type = row[2]
         if src_type.upper() != 'VARCHAR':
-            cast_to, fmt = None, None
+            cast_to, fmt, via_ts = None, None, False
         else:
-            cast_to, fmt = _pick_suggestion(analyses[name])
+            cast_to, fmt, via_ts = _pick_suggestion(analyses[name])
         specs.append(CastSpec(
             source=name,
             target=name,
             cast_to=cast_to,
             strict=False,
             date_format=fmt,
+            via_timestamp=via_ts,
         ))
     return create_derived_table(source_table, new_name, specs, None)
 
@@ -704,6 +777,11 @@ def _cast_expr(spec: CastSpec) -> str:
         fn = 'strptime' if spec.strict else 'try_strptime'
         return f"cast({fn}({src}, '{safe_fmt}') as {cast_to.lower()})"
     fn = 'cast' if spec.strict else 'try_cast'
+    # Midnight-only TIMESTAMP being downgraded to DATE: cast through
+    # TIMESTAMP first so the time portion of the source string doesn't
+    # trip DuckDB's strict YYYY-MM-DD date parser.
+    if spec.via_timestamp and up == 'DATE':
+        return f'{fn}({fn}({src} as timestamp) as date)'
     return f'{fn}({src} as {cast_to.lower()})'
 
 

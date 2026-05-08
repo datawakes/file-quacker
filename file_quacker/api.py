@@ -483,9 +483,10 @@ class Api:
     # File export                                                           #
     # --------------------------------------------------------------------- #
     def export_to_file(self, source: dict, target: dict,
-                       mappings: list[dict] | None = None) -> dict:
+                       mappings: list[dict] | None = None,
+                       trim_strings: bool = True) -> dict:
         from . import export_file
-        return export_file.export_to_file(source, target, mappings)
+        return export_file.export_to_file(source, target, mappings, trim_strings)
 
     def get_file_export_progress(self) -> dict:
         from . import export_file
