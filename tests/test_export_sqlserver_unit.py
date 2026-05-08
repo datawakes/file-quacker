@@ -154,6 +154,44 @@ def test_describe_error_row_annotates_message_with_value_repr():
     assert "lot_number='12\\x00ABC'" in result['message']
 
 
+def test_describe_error_row_caps_repr_at_50_chars():
+    """A long blob value shouldn't blow out the error pane; repr gets
+    truncated at 50 chars with a trailing ellipsis."""
+    mappings = _mappings(('blob_col', 'numeric(10,0)'))
+    row = ('Z' * 200,)
+    error = '[42000] Error converting data type nvarchar to numeric. (8114)'
+    msg = export._describe_error_row(1, row, mappings, error)['message']
+    # Annotation segment ends with '...' and the visible repr portion is bounded.
+    assert '...' in msg
+    annotation = msg.split(' · ', 1)[1]
+    # 50 chars of repr + 3 chars ellipsis, plus the "blob_col=" prefix.
+    assert len(annotation) <= len('blob_col=') + 50 + len('...')
+
+
+def test_mark_offending_columns_flags_bit_target_with_yes_no():
+    """8114-style errors fire for nvarchar→bit too, not just nvarchar→
+    numeric. A 'Yes' value bound to a bit column should get flagged by
+    the same fallback."""
+    mappings = _mappings(('is_active', 'bit'), ('amount', 'decimal(10,2)'))
+    row = ('Yes', '9.99')
+    error = (
+        '[42000] [Microsoft][SQL Server]Error converting data type '
+        'nvarchar to bit. (8114)'
+    )
+    marked = export._mark_offending_columns(row, mappings, error)
+    assert marked == ['is_active']
+
+
+def test_value_parses_as_target_bit_accepts_strict_set_only():
+    assert export._value_parses_as_target('bit', '0')
+    assert export._value_parses_as_target('bit', '1')
+    assert export._value_parses_as_target('bit', 'TRUE')
+    assert export._value_parses_as_target('bit', 'False')
+    assert not export._value_parses_as_target('bit', 'Yes')
+    assert not export._value_parses_as_target('bit', 'N')
+    assert not export._value_parses_as_target('bit', '')
+
+
 def test_mark_offending_columns_returns_empty_when_no_signal():
     """Errors that aren't conversion-related and lack column / value
     info shouldn't pollute marked with arbitrary numeric columns."""
