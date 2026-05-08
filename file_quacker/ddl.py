@@ -303,15 +303,15 @@ def _probe_timestamp(c, qtable: str, qcol: str) -> TimestampResult:
     value precedes 1753-01-01, and whether every value sits at midnight.
     SQL Server cares about the first two for the datetime / datetime2
     split; the midnight flag lets the caller downgrade to DATE."""
+    ts_expr = f'try_cast({qcol} as timestamp)'
     with instrument.timed('_probe_timestamp', col=qcol):
         row = c.execute(f"""
-            select  min(try_cast({qcol} as timestamp))                          as mn
-            ,       max(extract(microsecond from try_cast({qcol} as timestamp))) as mx_us
-            ,       sum(case when try_cast({qcol} as timestamp) is not null
-                              and date_trunc('day', try_cast({qcol} as timestamp))
-                                  <> try_cast({qcol} as timestamp)
-                         then 1 else 0 end)                                      as with_time
-            ,       count({qcol})                                                as n
+            select  min({ts_expr})                          as mn
+            ,       max(extract(microsecond from {ts_expr})) as mx_us
+            ,       sum(case when {ts_expr} is not null
+                              and {derive.has_time_sql(ts_expr)}
+                         then 1 else 0 end)                  as with_time
+            ,       count({qcol})                            as n
             from    {qtable}
             where   {qcol} is not null
             ;
