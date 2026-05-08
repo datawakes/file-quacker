@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from threading import RLock
 from typing import Literal
 
@@ -638,7 +639,7 @@ def _describe_error_row(row_num: int, row, mappings: list[ColumnMapping],
     # the SQL Server error doesn't already include the value.
     if marked:
         by_target = {m.target: v for m, v in zip(mappings, row)}
-        annots = [f'{col}={by_target.get(col)!r}' for col in marked]
+        annots = [f'{col}={_short_repr(by_target.get(col))}' for col in marked]
         if annots:
             msg = f'{msg} · {", ".join(annots)}'
     return {
@@ -647,6 +648,13 @@ def _describe_error_row(row_num: int, row, mappings: list[ColumnMapping],
         'values': _values_as_dict(row, mappings),
         'message': msg,
     }
+
+
+def _short_repr(v: object, limit: int = 50) -> str:
+    """repr(v), capped to ``limit`` chars with a trailing ellipsis so a
+    long blob value doesn't blow out the error pane."""
+    r = repr(v)
+    return r if len(r) <= limit else r[:limit] + '...'
 
 
 def _mark_offending_columns(row, mappings: list[ColumnMapping],
@@ -683,39 +691,46 @@ def _mark_offending_columns(row, mappings: list[ColumnMapping],
     return sorted(marked)
 
 
-_NUMERIC_TARGET_RE = re.compile(
-    r'^\s*(int|bigint|tinyint|smallint|decimal|numeric|float|real|money|smallmoney)\b',
+_TYPED_TARGET_RE = re.compile(
+    r'^\s*(int|bigint|tinyint|smallint|decimal|numeric|float|real|money|smallmoney|bit)\b',
     re.IGNORECASE,
 )
 
+# Strings SQL Server's bit type accepts on insert. Same accept set used by
+# ddl._has_only_strict_boolean_values, kept here as a tuple for fast
+# per-row checking.
+_BIT_ACCEPTED = ('0', '1', 'true', 'false')
+
 
 def _columns_failing_target_cast(row, mappings: list[ColumnMapping]) -> list[str]:
-    """Best-effort offender detection for numeric-conversion errors that
+    """Best-effort offender detection for type-conversion errors that
     SQL Server reports without naming the column. For each mapping with
-    a numeric target, parse the row's value the same way SQL Server's
-    bit / int / decimal cast would and return the columns that fail."""
+    a numeric or bit target, parse the row's value the same way the
+    bind layer would and return the columns that fail."""
     out: list[str] = []
     for m, v in zip(mappings, row):
         if v is None:
             continue
-        if not _NUMERIC_TARGET_RE.match(m.sql_type or ''):
+        if not _TYPED_TARGET_RE.match(m.sql_type or ''):
             continue
-        if not _value_parses_as_numeric(m.sql_type, v):
+        if not _value_parses_as_target(m.sql_type, v):
             out.append(m.target)
     return out
 
 
-def _value_parses_as_numeric(sql_type: str, v: object) -> bool:
-    """Whether ``v`` parses cleanly as the target SQL Server numeric
-    type. Mirrors the cases the bind layer's nvarchar→numeric cast
-    would fail on (non-numeric text, comma thousand separators, etc.)."""
+def _value_parses_as_target(sql_type: str, v: object) -> bool:
+    """Whether ``v`` parses cleanly as the target SQL Server type.
+    Mirrors the cases the bind layer's nvarchar→numeric / nvarchar→bit
+    cast would fail on (non-numeric text, comma thousand separators,
+    Yes/No strings on a bit column, etc.)."""
     s = str(v).strip()
     if not s:
         return False
     t = sql_type.lower()
     try:
+        if t.startswith('bit'):
+            return s.lower() in _BIT_ACCEPTED
         if t.startswith(('decimal', 'numeric', 'money', 'smallmoney')):
-            from decimal import Decimal
             Decimal(s)
             return True
         if t.startswith(('float', 'real')):
