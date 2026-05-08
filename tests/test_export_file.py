@@ -10,6 +10,12 @@ from file_quacker import db, ingest
 from file_quacker.api import Api
 
 
+def _write_csv(name: str, body: str) -> Path:
+    p = Path(tempfile.gettempdir()) / name
+    p.write_text(body, encoding='utf-8')
+    return p
+
+
 def test_export_flat_pipe():
     src = Path(tempfile.gettempdir()) / 'fq_file_src.csv'
     src.write_text(
@@ -106,3 +112,100 @@ def test_export_excel_with_mapping():
     rows = list(ws.iter_rows(values_only=True))
     assert rows[0] == ('ID', 'Name', 'Amount')
     assert len(rows) == 4
+
+
+def test_export_flat_trims_whitespace_by_default():
+    """VARCHAR cells lose leading / trailing whitespace; numeric columns
+    are untouched. Includes a Unicode separator (NBSP) and an ASCII info
+    separator (\\x1f) to confirm the cascade matches preprocess_ff."""
+    src = _write_csv(
+        'fq_trim_src.csv',
+        'id,name,note\n'
+        '1,"  alpha  "," unicode-nbsp "\n'
+        '2,"\tbeta\t","\x1finfo-sep\x1f"\n'
+        '3," gamma ","clean"\n',
+    )
+    r = ingest.load_file(str(src))
+    source = {'kind': 'table', 'name': r.name, 'sql': None}
+
+    out = Path(tempfile.gettempdir()) / 'fq_trim_default.txt'
+    out.unlink(missing_ok=True)
+    res = Api().export_to_file(source, {
+        'kind': 'flat', 'path': str(out),
+        'delimiter': '|', 'header': True, 'quote': '"', 'null': '',
+    })
+    assert res['ok']
+    rows = out.read_text(encoding='utf-8').splitlines()
+    assert rows[0] == 'id|name|note'
+    assert rows[1] == '1|alpha|unicode-nbsp'
+    assert rows[2] == '2|beta|info-sep'
+    assert rows[3] == '3|gamma|clean'
+
+
+def test_export_flat_trim_can_be_disabled():
+    """trim_strings=False keeps the source bytes intact."""
+    src = _write_csv(
+        'fq_trim_off.csv',
+        'id,name\n1,"  alpha  "\n2,"\tbeta\t"\n',
+    )
+    r = ingest.load_file(str(src))
+    source = {'kind': 'table', 'name': r.name, 'sql': None}
+
+    out = Path(tempfile.gettempdir()) / 'fq_trim_off.txt'
+    out.unlink(missing_ok=True)
+    res = Api().export_to_file(source, {
+        'kind': 'flat', 'path': str(out),
+        'delimiter': '|', 'header': True, 'quote': '"', 'null': '',
+    }, None, False)
+    assert res['ok']
+    rows = out.read_text(encoding='utf-8').splitlines()
+    # DuckDB's COPY only adds quotes when the value contains the delimiter,
+    # so the cells come through bare — but the whitespace is intact.
+    assert rows[1] == '1|  alpha  '
+    assert rows[2] == '2|\tbeta\t'
+
+
+def test_export_flat_trim_only_touches_string_columns():
+    """Trim wraps regexp_replace around VARCHAR columns only. Numeric
+    source columns are projected as bare identifiers, so their values
+    come through unchanged."""
+    src = _write_csv(
+        'fq_trim_numeric.csv',
+        'id,price\n1,1.55\n2,2.75\n',
+    )
+    r = ingest.load_file(str(src))
+    api = Api()
+    typed = api.auto_derive(r.name, f'{r.name}_typed')
+    source = {'kind': 'table', 'name': typed['name'], 'sql': None}
+
+    out = Path(tempfile.gettempdir()) / 'fq_trim_numeric.txt'
+    out.unlink(missing_ok=True)
+    res = api.export_to_file(source, {
+        'kind': 'flat', 'path': str(out),
+        'delimiter': '|', 'header': True, 'quote': '"', 'null': '',
+    })
+    assert res['ok']
+    rows = out.read_text(encoding='utf-8').splitlines()
+    assert rows[0] == 'id|price'
+    assert rows[1] == '1|1.55'
+    assert rows[2] == '2|2.75'
+
+
+def test_export_parquet_trim_default_on():
+    src = _write_csv(
+        'fq_trim_pq_src.csv',
+        'name,note\n  alpha  ,clean\n  beta  , nbsp \n',
+    )
+    r = ingest.load_file(str(src))
+    source = {'kind': 'table', 'name': r.name, 'sql': None}
+
+    out = Path(tempfile.gettempdir()) / 'fq_trim_out.parquet'
+    out.unlink(missing_ok=True)
+    res = Api().export_to_file(source, {
+        'kind': 'parquet', 'path': str(out), 'compression': 'snappy',
+    })
+    assert res['ok']
+    rows = db.conn().execute(
+        f"select name, note from read_parquet('{out.as_posix()}') order by name"
+    ).fetchall()
+    assert rows == [('alpha', 'clean'), ('beta', 'nbsp')]
