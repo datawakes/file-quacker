@@ -34,6 +34,7 @@ from .drivers import (
     TimestampResult,
     dialect_for,
 )
+from .export_file import WS_TRIM_PATTERN
 
 
 _DECIMAL_RE = re.compile(r'^DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$', re.IGNORECASE)
@@ -52,9 +53,15 @@ _DATETIME_FLOOR = '1753-01-01'
 # Public entry point                                                          #
 # --------------------------------------------------------------------------- #
 
-def generate(table_name: str, dialect: str = 'sqlserver') -> str:
+def generate(table_name: str, dialect: str = 'sqlserver',
+             trim_strings: bool = False) -> str:
     """Render a CREATE TABLE statement in `dialect`.  Defaults to
-    SQL Server; any registered dialect id is valid."""
+    SQL Server; any registered dialect id is valid.
+
+    ``trim_strings`` mirrors the export-time option: when on, string
+    columns are sized from their trimmed lengths so a downstream
+    char(N) target won't pad whitespace back into the trimmed values.
+    """
     # Drain any leftover events from a prior run so this run's summary
     # only reflects work this call did.
     instrument.take()
@@ -78,7 +85,7 @@ def generate(table_name: str, dialect: str = 'sqlserver') -> str:
             duck_type = row[2]
             with instrument.timed('column.total', col=name, src=duck_type):
                 nullable = _has_nulls(c, qtable, name)
-                sql_type = _column_type(c, qtable, name, duck_type, d)
+                sql_type = _column_type(c, qtable, name, duck_type, d, trim_strings)
             col_infos.append({'name': name, 'sql_type': sql_type, 'nullable': nullable})
 
         rendered = _format(table_name, col_infos, d)
@@ -105,9 +112,10 @@ def _has_nulls(c, qtable: str, col_name: str) -> bool:
 
 
 def _column_type(c, qtable: str, col_name: str, duck_type: str,
-                 d: Dialect) -> str:
+                 d: Dialect, trim_strings: bool = False) -> str:
     """Pick the right probe for `duck_type` and hand the result to
-    `d` for naming."""
+    `d` for naming.  ``trim_strings`` only affects string sizing; numeric
+    / date / timestamp probes don't care."""
     t = duck_type.upper()
     qcol = db.quote_ident(col_name)
 
@@ -147,7 +155,7 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
             if up == 'BOOLEAN':
                 if (not getattr(d, 'boolean_accepts_yes_no', True)
                         and not _has_only_strict_boolean_values(c, qtable, qcol)):
-                    return d.format_string(_probe_string(c, qtable, qcol))
+                    return d.format_string(_probe_string(c, qtable, qcol, trim_strings))
                 return d.format_boolean()
             if up == 'DATE':        return d.format_date()
             if up == 'TIMESTAMP':
@@ -157,7 +165,7 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
                     or up.startswith('DECIMAL')
                     or up.startswith('NUMERIC')):
                 return _render_numeric(c, qtable, qcol, d)
-        return d.format_string(_probe_string(c, qtable, qcol))
+        return d.format_string(_probe_string(c, qtable, qcol, trim_strings))
 
     return d.format_unknown()
 
@@ -342,12 +350,22 @@ def _probe_blob_len(c, qtable: str, qcol: str) -> int | None:
     return int(row[0])
 
 
-def _probe_string(c, qtable: str, qcol: str) -> StringResult:
-    """Min / max string length for sizing varchar / char."""
+def _probe_string(c, qtable: str, qcol: str,
+                  trim_strings: bool = False) -> StringResult:
+    """Min / max string length for sizing varchar / char.
+
+    When ``trim_strings`` is on, the lengths are measured after the
+    same whitespace strip the export pipeline applies. Without that, a
+    column of `' abc '`-style values (all 5 chars raw, all 3 chars
+    trimmed) would size as char(5), and SQL Server's char(5) padding
+    would put the trimmed-off whitespace right back as trailing spaces.
+    """
+    expr = (f"regexp_replace({qcol}, '{WS_TRIM_PATTERN}', '', 'g')"
+            if trim_strings else qcol)
     with instrument.timed('_probe_string', col=qcol):
         row = c.execute(f"""
-            select  min(length({qcol}))
-            ,       max(length({qcol}))
+            select  min(length({expr}))
+            ,       max(length({expr}))
             from    {qtable}
             where   {qcol} is not null
             ;
@@ -392,9 +410,11 @@ def _is_integer(t: str) -> bool:
     )
 
 
-def _sqlserver_type(c, qtable: str, col_name: str, duck_type: str) -> str:
+def _sqlserver_type(c, qtable: str, col_name: str, duck_type: str,
+                    trim_strings: bool = False) -> str:
     """SQL Server column type for ``col_name``, sized from observed values."""
-    return _column_type(c, qtable, col_name, duck_type, dialect_for('sqlserver'))
+    return _column_type(c, qtable, col_name, duck_type,
+                        dialect_for('sqlserver'), trim_strings)
 
 
 # --------------------------------------------------------------------------- #
