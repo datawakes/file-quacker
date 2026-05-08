@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from file_quacker import db, export, ingest
+from file_quacker import export, ingest
 
 
 @pytest.mark.parametrize('src,expected', [
@@ -55,9 +55,12 @@ def test_unique_target_handles_existing_suffix_source():
     """A literal source named `foo_1` that comes after two `foo`s gets
     `foo_1_1` because `foo_1` was already claimed by the de-duper."""
     taken: set[str] = set()
-    t1 = export._unique_target('foo', taken); taken.add(t1)
-    t2 = export._unique_target('foo', taken); taken.add(t2)
-    t3 = export._unique_target('foo_1', taken); taken.add(t3)
+    t1 = export._unique_target('foo', taken)
+    taken.add(t1)
+    t2 = export._unique_target('foo', taken)
+    taken.add(t2)
+    t3 = export._unique_target('foo_1', taken)
+    taken.add(t3)
     assert (t1, t2, t3) == ('foo', 'foo_1', 'foo_1_1')
 
 
