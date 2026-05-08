@@ -362,7 +362,7 @@ interface PywebviewApi {
   test_sqlserver_connection(conn_opts: SqlServerConnectionOptions): Promise<{ ok: boolean; server_version?: string; error?: string }>
   list_sqlserver_databases(conn_opts: SqlServerConnectionOptions): Promise<string[]>
   list_sqlserver_schemas(conn_opts: SqlServerConnectionOptions): Promise<string[]>
-  suggest_export_mappings(source: ExportSource): Promise<ExportMappingSuggestion[]>
+  suggest_export_mappings(source: ExportSource, trim_strings?: boolean): Promise<ExportMappingSuggestion[]>
   preview_export_ddl(export_opts: SqlServerExportOptions): Promise<{ sql: string }>
   export_to_sqlserver(
     conn_opts: SqlServerConnectionOptions,
@@ -462,7 +462,7 @@ export const checkOdbcDriver         = ()                                 => wit
 export const testSqlServerConnection = (o: SqlServerConnectionOptions)    => withApi(a => a.test_sqlserver_connection(o))
 export const listSqlServerDatabases  = (o: SqlServerConnectionOptions)    => withApi(a => a.list_sqlserver_databases(o))
 export const listSqlServerSchemas    = (o: SqlServerConnectionOptions)    => withApi(a => a.list_sqlserver_schemas(o))
-export const suggestExportMappings   = (src: ExportSource)                => withApi(a => a.suggest_export_mappings(src))
+export const suggestExportMappings   = (src: ExportSource, trimStrings?: boolean) => withApi(a => a.suggest_export_mappings(src, trimStrings))
 export const previewExportDdl        = (e: SqlServerExportOptions)        => withApi(a => a.preview_export_ddl(e))
 export const exportToSqlServer       = (c: SqlServerConnectionOptions, e: SqlServerExportOptions) =>
   withApi(a => a.export_to_sqlserver(c, e))

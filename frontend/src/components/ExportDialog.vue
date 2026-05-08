@@ -105,7 +105,7 @@ onMounted(async () => {
     const dc = await checkOdbcDriver()
     if (!mounted) return
     driverCheck.value = dc
-    const suggestions = await suggestExportMappings(props.source)
+    const suggestions = await suggestExportMappings(props.source, trimStrings.value)
     if (!mounted) return
     rows.value = suggestions.map(s => ({
       source: s.source,
@@ -130,6 +130,28 @@ onBeforeUnmount(() => {
 
 // --- DDL preview (debounced) ----------------------------------------- //
 watch([rows, schema, tableName], scheduleDdlRefresh, { deep: true })
+
+// Re-fetch suggestions when the trim toggle flips so column type sizes
+// (varchar(N), char(N)) reflect the trimmed lengths the export will use.
+watch(trimStrings, async (newVal) => {
+  try {
+    const suggestions = await suggestExportMappings(props.source, newVal)
+    if (!mounted) return
+    // Only refresh sql_type and source_type; keep the user's edits to
+    // target name and nullable.
+    const byTarget = new Map(rows.value.map(r => [r.source, r]))
+    rows.value = suggestions.map(s => {
+      const existing = byTarget.get(s.source)
+      return existing
+        ? { ...existing, sql_type: s.sql_type, source_type: s.source_type }
+        : { source: s.source, source_type: s.source_type, target: s.target,
+            sql_type: s.sql_type, nullable: s.nullable }
+    })
+    scheduleDdlRefresh()
+  } catch (e) {
+    if (mounted) toasts.show(e instanceof Error ? e.message : String(e), 'error', 5000)
+  }
+})
 
 function scheduleDdlRefresh() {
   if (ddlDebounce != null) window.clearTimeout(ddlDebounce)
