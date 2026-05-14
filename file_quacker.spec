@@ -3,11 +3,69 @@
 # Run `npm --prefix frontend run build` first so frontend/dist/ exists,
 # then `pyinstaller file_quacker.spec` to build dist/file_quacker.exe.
 
+import re
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.win32.versioninfo import (
+    FixedFileInfo,
+    StringFileInfo,
+    StringStruct,
+    StringTable,
+    VarFileInfo,
+    VarStruct,
+    VSVersionInfo,
+)
 
 PROJECT_ROOT = Path(SPECPATH).resolve()
+
+# Read __version__ directly from the source file rather than importing
+# file_quacker — the package pulls in pyodbc / duckdb / pywebview at
+# import time, which we don't want to do from inside the spec.
+_init_text = (PROJECT_ROOT / 'file_quacker' / '__init__.py').read_text(encoding='utf-8')
+_match = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", _init_text)
+if not _match:
+    raise RuntimeError("could not parse __version__ from file_quacker/__init__.py")
+APP_VERSION = _match.group(1)
+
+# Windows VERSIONINFO wants a 4-part tuple of ints.  Pad with zeros so
+# semver-style 'X.Y.Z' becomes (X, Y, Z, 0).
+_parts = [int(p) for p in APP_VERSION.split('.')]
+while len(_parts) < 4:
+    _parts.append(0)
+VERSION_TUPLE = tuple(_parts[:4])
+VERSION_STRING = '.'.join(str(p) for p in VERSION_TUPLE)
+
+# Right-click -> Properties -> Details on the built exe reads this.
+# StringTable id '040904B0' is en-US + Unicode codepage; matches the
+# VarFileInfo Translation entry below.  Keep them in sync.
+version_info = VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=VERSION_TUPLE,
+        prodvers=VERSION_TUPLE,
+        mask=0x3F,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo([
+            StringTable('040904B0', [
+                StringStruct('CompanyName',      'Datawake LLC'),
+                StringStruct('FileDescription',  'File Quacker'),
+                StringStruct('FileVersion',      VERSION_STRING),
+                StringStruct('InternalName',     'file_quacker'),
+                StringStruct('LegalCopyright',   'Copyright (c) 2026 Tim Civatte. MIT License.'),
+                StringStruct('OriginalFilename', 'file_quacker.exe'),
+                StringStruct('ProductName',      'File Quacker'),
+                StringStruct('ProductVersion',   VERSION_STRING),
+            ]),
+        ]),
+        VarFileInfo([VarStruct('Translation', [0x0409, 0x04B0])]),
+    ],
+)
 
 # pywebview ships platform-specific backends that PyInstaller's static
 # analysis can miss; collect_all walks the package and picks them up.
@@ -51,4 +109,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(PROJECT_ROOT / 'file_quacker.ico'),
+    version=version_info,
 )

@@ -14,6 +14,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Verify __version__ matches tag
+        shell: bash
+        run: |
+          set -e
+          tag="${GITHUB_REF_NAME#v}"
+          file_ver=$(sed -nE "s/^__version__[[:space:]]*=[[:space:]]*['\"]([^'\"]+)['\"].*/\1/p" file_quacker/__init__.py)
+          if [ -z "$file_ver" ]; then
+            echo "couldn't parse __version__ from file_quacker/__init__.py"
+            exit 1
+          fi
+          if [ "$tag" != "$file_ver" ]; then
+            echo "tag $GITHUB_REF_NAME doesn't match file_quacker.__version__=$file_ver"
+            echo "bump file_quacker/__init__.py before tagging."
+            exit 1
+          fi
+          echo "ok: tag $GITHUB_REF_NAME == __version__ $file_ver"
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
