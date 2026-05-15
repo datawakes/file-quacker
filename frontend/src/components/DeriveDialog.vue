@@ -18,6 +18,7 @@ import {
 import { useToasts } from '../stores/toasts'
 import { useTablesStore } from '../stores/tables'
 import { useFocusTrap } from '../composables/useFocusTrap'
+import { useInspectProgress } from '../composables/useInspectProgress'
 
 const dialogRef = ref<HTMLElement | null>(null)
 useFocusTrap(dialogRef)
@@ -77,8 +78,10 @@ const panelView = ref<PanelView>('empty')
 const loading = ref(true)
 const busy = ref(false)
 const error = ref<string | null>(null)
+const { label: inspectLabel, start: startInspectPoll, stop: stopInspectPoll } = useInspectProgress()
 
 onMounted(async () => {
+  startInspectPoll()
   try {
     const suggestions = await suggestCasts(props.source)
     rows.value = suggestions
@@ -98,6 +101,7 @@ onMounted(async () => {
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
+    stopInspectPoll()
     loading.value = false
   }
 })
@@ -272,7 +276,7 @@ function onSourceResizeStart(ev: PointerEvent) {
         <!-- Left: per-column cast builder -->
         <div class="flex min-h-0 flex-col">
           <div class="min-h-0 flex-1 overflow-auto px-3 pb-2 pt-3 text-xs">
-            <div v-if="loading" class="text-ink-subtle">Analyzing columns…</div>
+            <div v-if="loading" class="text-ink-subtle">{{ inspectLabel }}</div>
             <div v-else-if="error" class="font-mono text-danger whitespace-pre-wrap">{{ error }}</div>
             <template v-else>
               <table

@@ -22,20 +22,20 @@ def test_table_kind_is_passthrough():
     cleanup()
 
 
-def test_query_kind_creates_and_drops_view():
+def test_query_kind_creates_and_drops_table():
     p = Path(tempfile.gettempdir()) / 'fq_src.csv'
     p.write_text('id,name\n1,alpha\n2,beta\n', encoding='utf-8')
     r = ingest.load_file(str(p))
 
     src = ExportSource(kind='query', name=None, sql=f'select id from "{r.name}" where id = 1')
     qname, cleanup = src.materialize()
-    assert qname.startswith('fq_export_')
+    assert qname.startswith('__fq_export_')
     (n,) = db.conn().execute(f'select count(*) from "{qname}"').fetchone()
     assert n == 1
     cleanup()
 
     (gone,) = db.conn().execute(
-        "select count(*) from information_schema.views where table_name = ?",
+        "select count(*) from information_schema.tables where table_name = ?",
         [qname],
     ).fetchone()
     assert gone == 0

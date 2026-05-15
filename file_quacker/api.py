@@ -24,6 +24,7 @@ from . import (
     derive,
     export as export_mod,
     ingest,
+    inspect_progress,
     profile as profile_mod,
     sql as sql_mod,
 )
@@ -42,6 +43,11 @@ class Api:
             'platform': platform.platform(),
             'duckdb_version': duckdb.__version__,
         }
+
+    def get_inspect_progress(self) -> dict:
+        """Column-inspection progress, polled by the frontend during
+        export / DDL / derive analysis."""
+        return inspect_progress.get_progress()
 
     def set_window_title(self, title: str) -> dict:
         """Update the OS window title. e.g. ``File Quacker – /path/to.csv``."""
@@ -163,8 +169,8 @@ class Api:
     # --------------------------------------------------------------------- #
     def list_tables(self) -> list[dict]:
         """All tables + views in the current schema, with row counts.
-        Internal result tables (``__fq_sql_result_*``) are filtered out
-        so they don't surface in the sidebar."""
+        Internal helpers (``__fq_sql_result_*``, ``__fq_export_*``) are
+        filtered out so they don't surface in the sidebar."""
         c = db.conn()
         rows = c.execute("""
             select  table_name     as table_name
@@ -172,6 +178,7 @@ class Api:
             from    information_schema.tables
             where   table_schema = current_schema()
             and     table_name not like '\\_\\_fq\\_sql\\_result\\_%' escape '\\'
+            and     table_name not like '\\_\\_fq\\_export\\_%'       escape '\\'
             order   by table_name
             ;
         """).fetchall()

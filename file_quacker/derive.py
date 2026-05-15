@@ -25,13 +25,13 @@ silently into BIGINT.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import duckdb
 
-from . import db, instrument
+from . import db, inspect_progress, instrument
 from .db import display_ident as _display_ident
 
 SUGGEST_THRESHOLD = 95.0
@@ -131,42 +131,50 @@ class CastSpec:
 def suggest_casts(table_name: str) -> list[dict]:
     c = db.conn()
     qtable = db.quote_ident(table_name)
-    cols = c.execute(f"""
+    rows = c.execute(f"""
         pragma table_info({qtable})
         ;
     """).fetchall()
 
-    varchar_names = [row[1] for row in cols if row[2].upper() == 'VARCHAR']
-    analyses = _analyze_varchar_cols(qtable, varchar_names)
+    cols = [(row[1], row[2]) for row in rows]
+    total = len(cols)
+    varchar_names = [name for name, src_type in cols if src_type.upper() == 'VARCHAR']
+    non_varchar_count = total - len(varchar_names)
 
-    out: list[dict] = []
-    for row in cols:
-        name = row[1]
-        src_type = row[2]
-        qcol = db.quote_ident(name)
-        sample = _sample(c, qtable, qcol)
-        if src_type.upper() != 'VARCHAR':
+    with inspect_progress.session(total=total):
+        inspect_progress.set_progress(current=non_varchar_count)
+
+        def _tick(n: int) -> None:
+            inspect_progress.set_progress(current=non_varchar_count + n)
+
+        analyses = _analyze_varchar_cols(qtable, varchar_names, on_done=_tick)
+
+        out: list[dict] = []
+        for name, src_type in cols:
+            qcol = db.quote_ident(name)
+            sample = _sample(c, qtable, qcol)
+            if src_type.upper() != 'VARCHAR':
+                out.append({
+                    'source': name,
+                    'source_type': src_type,
+                    'suggested_type': None,
+                    'cast_coverage': {},
+                    'sample_values': sample,
+                    'detected_date_format': None,
+                })
+                continue
+
+            analysis = analyses[name]
+            suggested, fmt, via_ts = _pick_suggestion(analysis)
             out.append({
                 'source': name,
                 'source_type': src_type,
-                'suggested_type': None,
-                'cast_coverage': {},
+                'suggested_type': suggested,
+                'cast_coverage': analysis['coverage'],
                 'sample_values': sample,
-                'detected_date_format': None,
+                'detected_date_format': fmt,
+                'via_timestamp': via_ts,
             })
-            continue
-
-        analysis = analyses[name]
-        suggested, fmt, via_ts = _pick_suggestion(analysis)
-        out.append({
-            'source': name,
-            'source_type': src_type,
-            'suggested_type': suggested,
-            'cast_coverage': analysis['coverage'],
-            'sample_values': sample,
-            'detected_date_format': fmt,
-            'via_timestamp': via_ts,
-        })
     return out
 
 
@@ -175,7 +183,11 @@ def _timed_analyze_one(qtable: str, col_name: str) -> tuple[str, dict]:
         return col_name, _analyze_one(qtable, col_name)
 
 
-def _analyze_varchar_cols(qtable: str, col_names: list[str]) -> dict[str, dict]:
+def _analyze_varchar_cols(
+    qtable: str,
+    col_names: list[str],
+    on_done: Callable[[int], None] | None = None,
+) -> dict[str, dict]:
     """Analyze VARCHAR columns in parallel.
 
     Each column gets a small ASC/DESC distinct-value sniff first. The full-table
@@ -184,13 +196,24 @@ def _analyze_varchar_cols(qtable: str, col_names: list[str]) -> dict[str, dict]:
     Per-column queries are faster here than one large aggregate query, and worker
     threads improve wall-clock time because DuckDB cursors share the same root
     connection safely.
+
+    ``on_done(n_completed)`` fires after each result lands; callers wire
+    it to the shared inspect-progress counter.
     """
     if not col_names:
         return {}
     max_workers = min(8, len(col_names))
+    out: dict[str, dict] = {}
+    done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        pairs = list(ex.map(lambda n: _timed_analyze_one(qtable, n), col_names))
-    return dict(pairs)
+        futures = [ex.submit(_timed_analyze_one, qtable, n) for n in col_names]
+        for fut in as_completed(futures):
+            name, analysis = fut.result()
+            out[name] = analysis
+            done += 1
+            if on_done is not None:
+                on_done(done)
+    return out
 
 
 def _analyze_one(qtable: str, col_name: str) -> dict:
