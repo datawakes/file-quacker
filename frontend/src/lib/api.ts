@@ -281,6 +281,13 @@ export interface ExportProgress {
   error: string | null
 }
 
+export interface InspectProgress {
+  phase: 'idle' | 'inspecting' | 'done' | 'error'
+  current: number
+  total: number
+  error: string | null
+}
+
 export interface ExportErrorRow {
   row: number
   marked: string[]
@@ -317,6 +324,7 @@ export interface FileExportResult {
 
 interface PywebviewApi {
   ping(): Promise<PingResponse>
+  get_inspect_progress(): Promise<InspectProgress>
   set_window_title(title: string): Promise<{ ok: boolean }>
   clipboard_read(): Promise<string>
   open_file_dialog(): Promise<string | null>
@@ -425,6 +433,7 @@ async function withApi<T>(fn: (api: PywebviewApi) => Promise<T>): Promise<T> {
 }
 
 export const ping            = ()                                    => withApi(a => a.ping())
+export const getInspectProgress = ()                                  => withApi(a => a.get_inspect_progress())
 export const setWindowTitle  = (title: string)                        => withApi(a => a.set_window_title(title))
 export const openFileDialog  = ()                                    => withApi(a => a.open_file_dialog())
 export const saveFileDialog  = (defaultName: string, fileTypes?: string[]) => withApi(a => a.save_file_dialog(defaultName, fileTypes))

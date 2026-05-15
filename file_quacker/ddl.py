@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 
-from . import db, derive, instrument
+from . import db, derive, inspect_progress, instrument
 from .drivers import (
     Dialect,
     NumericResult,
@@ -76,17 +76,17 @@ def generate(table_name: str, dialect: str = 'sqlserver',
         if not rows:
             raise ValueError(f'no columns for {table_name}')
 
+        # _src_row_num is internal metadata; never appears in DDL.
+        cols = [(r[1], r[2]) for r in rows if r[1] != '_src_row_num']
+
         col_infos: list[dict] = []
-        for row in rows:
-            name = row[1]
-            # `_src_row_num` is internal metadata; never appears in DDL.
-            if name == '_src_row_num':
-                continue
-            duck_type = row[2]
-            with instrument.timed('column.total', col=name, src=duck_type):
-                nullable = _has_nulls(c, qtable, name)
-                sql_type = _column_type(c, qtable, name, duck_type, d, trim_strings)
-            col_infos.append({'name': name, 'sql_type': sql_type, 'nullable': nullable})
+        with inspect_progress.session(total=len(cols)):
+            for i, (name, duck_type) in enumerate(cols):
+                with instrument.timed('column.total', col=name, src=duck_type):
+                    nullable = _has_nulls(c, qtable, name)
+                    sql_type = _column_type(c, qtable, name, duck_type, d, trim_strings)
+                col_infos.append({'name': name, 'sql_type': sql_type, 'nullable': nullable})
+                inspect_progress.set_progress(current=i + 1)
 
         rendered = _format(table_name, col_infos, d)
 
@@ -112,7 +112,8 @@ def _has_nulls(c, qtable: str, col_name: str) -> bool:
 
 
 def _column_type(c, qtable: str, col_name: str, duck_type: str,
-                 d: Dialect, trim_strings: bool = False) -> str:
+                 d: Dialect, trim_strings: bool = False,
+                 analysis: dict | None = None) -> str:
     """Pick the right probe for `duck_type` and hand the result to
     `d` for naming.  ``trim_strings`` only affects string sizing; numeric
     / date / timestamp probes don't care."""
@@ -149,7 +150,7 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
         return _render_numeric(c, qtable, qcol, d)
 
     if t == 'VARCHAR':
-        suggested, _fmt, _via_ts = _varchar_type_suggestion(qtable, col_name)
+        suggested, _fmt, _via_ts = _varchar_type_suggestion(qtable, col_name, analysis)
         if suggested:
             up = suggested.upper()
             if up == 'BOOLEAN':
@@ -394,12 +395,14 @@ def _has_only_strict_boolean_values(c, qtable: str, qcol: str) -> bool:
     return int(row[0] or 0) == 0
 
 
-def _varchar_type_suggestion(qtable: str, col_name: str) -> tuple[str | None, str | None, bool]:
+def _varchar_type_suggestion(qtable: str, col_name: str,
+                              analysis: dict | None = None) -> tuple[str | None, str | None, bool]:
     """Run the Clone analyzer at the strict 100% threshold to pick
     the column's umbrella (BIGINT, DOUBLE, DECIMAL, DATE, TIMESTAMP,
     BOOLEAN); a single non-conforming value would break the export
     bind, so the suggestion has to hold for every non-null row."""
-    analysis = derive._analyze_one(qtable, col_name)
+    if analysis is None:
+        analysis = derive._analyze_one(qtable, col_name)
     return derive._pick_suggestion(analysis, threshold=derive.STRICT_THRESHOLD)
 
 
@@ -411,10 +414,13 @@ def _is_integer(t: str) -> bool:
 
 
 def _sqlserver_type(c, qtable: str, col_name: str, duck_type: str,
-                    trim_strings: bool = False) -> str:
-    """SQL Server column type for ``col_name``, sized from observed values."""
+                    trim_strings: bool = False,
+                    analysis: dict | None = None) -> str:
+    """SQL Server column type for ``col_name``, sized from observed values.
+
+    Pass ``analysis`` when the caller already ran the VARCHAR analyzer."""
     return _column_type(c, qtable, col_name, duck_type,
-                        dialect_for('sqlserver'), trim_strings)
+                        dialect_for('sqlserver'), trim_strings, analysis)
 
 
 # --------------------------------------------------------------------------- #

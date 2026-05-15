@@ -6,6 +6,7 @@
 import { ref, watch } from 'vue'
 import { Copy, X } from 'lucide-vue-next'
 import { generateDdl } from '../lib/api'
+import { useInspectProgress } from '../composables/useInspectProgress'
 import { useToasts } from '../stores/toasts'
 
 const props = defineProps<{ table: string }>()
@@ -18,16 +19,19 @@ const dialect = ref<Dialect>('sqlserver')
 const sql = ref<string>('')
 const loading = ref(false)
 const error = ref<string | null>(null)
+const { label: inspectLabel, start: startInspectPoll, stop: stopInspectPoll } = useInspectProgress()
 
 async function load() {
   loading.value = true
   error.value = null
+  startInspectPoll()
   try {
     const r = await generateDdl(props.table, dialect.value)
     sql.value = r.sql
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
+    stopInspectPoll()
     loading.value = false
   }
 }
@@ -86,7 +90,7 @@ function onPanelCopy(e: ClipboardEvent) {
 
     <!-- Body -->
     <div class="min-h-0 flex-1 overflow-auto px-3 py-3">
-      <div v-if="loading" class="text-xs text-ink-subtle">Generating…</div>
+      <div v-if="loading" class="text-xs text-ink-subtle">{{ inspectLabel }}</div>
       <div v-else-if="error" class="font-mono text-xs text-danger whitespace-pre-wrap">{{ error }}</div>
       <pre
         v-else

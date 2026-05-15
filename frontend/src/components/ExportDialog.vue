@@ -27,6 +27,7 @@ import {
 } from '../lib/api'
 import { useToasts } from '../stores/toasts'
 import { useFocusTrap } from '../composables/useFocusTrap'
+import { useInspectProgress } from '../composables/useInspectProgress'
 import Splitter from './Splitter.vue'
 import SqlServerTargetPane from './export/SqlServerTargetPane.vue'
 import FileTargetPane from './export/FileTargetPane.vue'
@@ -89,6 +90,7 @@ const progress = ref<ExportProgress | null>(null)
 const lastResult = ref<ExportResult | null>(null)
 const exporting = ref(false)
 const loading = ref(true)
+const { label: inspectLabel, start: startInspectPoll, stop: stopInspectPoll } = useInspectProgress()
 
 // --- splitter width (bottom row: mapping | ddl preview) ------------- //
 const mappingWidth = ref(640)
@@ -101,6 +103,7 @@ let ddlDebounce: number | null = null
 let mounted = true
 
 onMounted(async () => {
+  startInspectPoll()
   try {
     const dc = await checkOdbcDriver()
     if (!mounted) return
@@ -118,6 +121,7 @@ onMounted(async () => {
   } catch (e) {
     if (mounted) toasts.show(e instanceof Error ? e.message : String(e), 'error', 5000)
   } finally {
+    stopInspectPoll()
     if (mounted) loading.value = false
   }
 })
@@ -134,6 +138,8 @@ watch([rows, schema, tableName], scheduleDdlRefresh, { deep: true })
 // Re-fetch suggestions when the trim toggle flips so column type sizes
 // (varchar(N), char(N)) reflect the trimmed lengths the export will use.
 watch(trimStrings, async (newVal) => {
+  loading.value = true
+  startInspectPoll()
   try {
     const suggestions = await suggestExportMappings(props.source, newVal)
     if (!mounted) return
@@ -150,6 +156,9 @@ watch(trimStrings, async (newVal) => {
     scheduleDdlRefresh()
   } catch (e) {
     if (mounted) toasts.show(e instanceof Error ? e.message : String(e), 'error', 5000)
+  } finally {
+    stopInspectPoll()
+    if (mounted) loading.value = false
   }
 })
 
@@ -472,7 +481,7 @@ const fileOperationPreview = computed(() => {
               <span class="ml-auto text-2xs text-ink-subtle">{{ rows.length }} cols</span>
             </div>
             <div class="min-h-0 flex-1 overflow-y-auto px-3 pb-3 text-xs">
-              <div v-if="loading" class="text-ink-subtle">Inspecting columns…</div>
+              <div v-if="loading" class="text-ink-subtle">{{ inspectLabel }}</div>
               <table v-else class="w-full border-collapse">
                 <thead>
                   <tr class="sticky top-0 bg-surface-1 text-left text-2xs uppercase tracking-wide text-ink-subtle">

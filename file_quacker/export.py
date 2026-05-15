@@ -21,7 +21,7 @@ from typing import Literal
 
 import pyodbc
 
-from . import db, ddl as ddl_mod
+from . import db, ddl as ddl_mod, derive, inspect_progress
 from .export_file import _project, _string_columns
 from .export_source import ExportSource
 
@@ -298,27 +298,45 @@ def suggest_mappings(source: 'ExportSource | dict',
             pragma table_info({qtable})
             ;
         """).fetchall()
-        out: list[dict] = []
-        taken: set[str] = set()
-        for row in rows:
-            name = row[1]
-            if name == '_src_row_num':
-                continue
-            duck_type = row[2]
-            sql_type = ddl_mod._sqlserver_type(c, qtable, name, duck_type, trim_strings)
-            nullable = ddl_mod._has_nulls(c, qtable, name)
-            target = _unique_target(_to_snake_case(name), taken)
-            taken.add(target)
-            out.append({
-                'source': name,
-                'source_type': duck_type,
-                'target': target,
-                'sql_type': sql_type,
-                'nullable': nullable,
-            })
+        # _src_row_num is internal metadata; don't surface it as a column.
+        cols = [(r[1], r[2]) for r in rows if r[1] != '_src_row_num']
+        total = len(cols)
+
+        varchar_names = [n for (n, t) in cols if t.upper() == 'VARCHAR']
+        non_varchar_count = total - len(varchar_names)
+
+        with inspect_progress.session(total=total):
+            inspect_progress.set_progress(current=non_varchar_count)
+
+            def _tick(n: int) -> None:
+                inspect_progress.set_progress(current=non_varchar_count + n)
+
+            analyses = derive._analyze_varchar_cols(qtable, varchar_names, on_done=_tick)
+
+            out: list[dict] = []
+            taken: set[str] = set()
+            for name, duck_type in cols:
+                sql_type = ddl_mod._sqlserver_type(
+                    c, qtable, name, duck_type, trim_strings,
+                    analysis=analyses.get(name),
+                )
+                nullable = ddl_mod._has_nulls(c, qtable, name)
+                target = _unique_target(_to_snake_case(name), taken)
+                taken.add(target)
+                out.append({
+                    'source': name,
+                    'source_type': duck_type,
+                    'target': target,
+                    'sql_type': sql_type,
+                    'nullable': nullable,
+                })
         return out
     finally:
-        cleanup()
+        # Best-effort drop.  Raising here would hide the real error.
+        try:
+            cleanup()
+        except Exception:
+            pass
 
 
 def preview_ddl(exp: ExportOptions) -> str:
