@@ -46,6 +46,11 @@ interface SheetEdit {
 const sheets = ref<SheetEdit[]>([])
 const activeIdx = ref(0)
 
+// Comma-separated tokens that become real NULL after load.  Case-sensitive,
+// so `Null` / `Na` (surname, country code) survive even with this on.
+const nullifyEnabled = ref(true)
+const nullifyText = ref('NaN, NULL')
+
 watch(excelFile, (info) => {
   if (!info) {
     sheets.value = []
@@ -54,6 +59,10 @@ watch(excelFile, (info) => {
   sheets.value = info.sheets.map(s => ({ ...s, selected: true }))
   activeIdx.value = 0
 }, { immediate: true })
+
+function parseNullifyTokens(s: string): string[] {
+  return s.split(',').map(t => t.trim()).filter(t => t.length > 0)
+}
 
 const active = computed(() => sheets.value[activeIdx.value] ?? null)
 const thisPath = computed(() => excelFile.value?.this_path ?? '')
@@ -76,12 +85,18 @@ function specsFor(list: SheetEdit[]): ExcelSheetSpec[] {
   }))
 }
 
+function buildOpts() {
+  const tokens = nullifyEnabled.value ? parseNullifyTokens(nullifyText.value) : []
+  return { nullify_tokens: tokens }
+}
+
 async function loadOne() {
   if (!active.value) return close()
   const path = thisPath.value
   const specs = specsFor([active.value])
+  const opts = buildOpts()
   close()
-  await tables.loadExcelSheets(path, specs)
+  await tables.loadExcelSheets(path, specs, opts)
 }
 
 async function loadSelected() {
@@ -89,8 +104,9 @@ async function loadSelected() {
   if (!picked.length) return close()
   const path = thisPath.value
   const specs = specsFor(picked)
+  const opts = buildOpts()
   close()
-  await tables.loadExcelSheets(path, specs)
+  await tables.loadExcelSheets(path, specs, opts)
 }
 
 // Preview: if the user clicks a cell, set that as the new header row +
@@ -214,7 +230,7 @@ function colIndex(letter: string): number {
 
         <!-- Preview + origin controls -->
         <div class="flex min-h-0 min-w-0 flex-1 flex-col">
-          <div class="flex shrink-0 items-center gap-3 px-3 pb-2 pt-3 text-xs">
+          <div class="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2 pt-3 text-xs">
             <span class="text-ink-muted">Header row</span>
             <input
               v-if="active"
@@ -242,6 +258,22 @@ function colIndex(letter: string): number {
             <span v-if="active && active.detected" class="ml-auto text-2xs text-ink-subtle">
               Auto-detected — click a cell to move the data origin.
             </span>
+            <div class="flex basis-full items-center gap-3">
+              <label
+                class="flex items-center gap-1.5 text-ink-muted cursor-pointer"
+                title="When checked, cells matching any of the comma-separated values become real NULL.  Case-sensitive — 'NULL' matches but 'Null' / 'null' don't."
+              >
+                <input type="checkbox" v-model="nullifyEnabled" />
+                Convert to <em class="font-mono text-ink">NULL</em>
+              </label>
+              <input
+                type="text"
+                v-model="nullifyText"
+                :disabled="!nullifyEnabled"
+                placeholder="NaN, NULL"
+                class="h-6 w-44 rounded border border-border bg-surface-0 px-2 font-mono outline-none focus:border-accent disabled:opacity-50"
+              />
+            </div>
           </div>
 
           <div class="min-h-0 min-w-0 flex-1 overflow-auto px-3 pb-3">

@@ -501,23 +501,17 @@ def _load_xlsx(path: Path, opts: IngestOptions) -> IngestResult:
     }
     if opts.sheet:
         params['sheet'] = opts.sheet
-    # Preamble cropping.  When the auto-detect step (or the user)
-    # tells us the data doesn't start at A1, pass a `range=` with a
-    # computed end column and `stop_at_empty=true` so trailing empty
-    # rows aren't materialized into millions of NULL rows.  When
-    # there's no preamble we let DuckDB pick the bounds itself.
+    # Bounded `range=` keeps DuckDB's loaded columns aligned with the
+    # date-intent probe below; `stop_at_empty=true` stops a column-only
+    # range like `A1:B` from reading 1M empty Excel rows.
     start_col = (opts.excel_start_col or 'A').upper()
     header_row = max(1, opts.excel_header_row or 1)
     end_col = (opts.excel_end_col or '').upper() or None
     params['header'] = True
-    if header_row > 1 or start_col != 'A' or end_col is not None:
-        # `range='B3:XFD'` would have DuckDB allocate ~16k columns
-        # and OOM.  When the caller didn't pin an end column, probe
-        # it via openpyxl so we always pass a bounded range.
-        if end_col is None:
-            end_col = _detect_end_col_on_row(path, opts.sheet, header_row, start_col)
-        params['range'] = f'{start_col}{header_row}:{end_col}'
-        params['stop_at_empty'] = True
+    if end_col is None:
+        end_col = _detect_end_col_on_row(path, opts.sheet, header_row, start_col)
+    params['range'] = f'{start_col}{header_row}:{end_col}'
+    params['stop_at_empty'] = True
 
     def _build_sql(p: Path, kw: str) -> str:
         return f"""
@@ -560,6 +554,17 @@ def _load_xlsx(path: Path, opts: IngestOptions) -> IngestResult:
         if cleaned is not None and cleaned.exists():
             cleaned.unlink(missing_ok=True)
 
+    if opts.materialize:
+        # read_xlsx with all_varchar=True strips Excel's cell formats,
+        # so re-read them via openpyxl and convert date serials → ISO.
+        try:
+            intents = _detect_excel_column_intents(
+                path, opts.sheet, header_row, start_col, end_col,
+                nullify_tokens=opts.nullify_tokens,
+            )
+        except Exception:
+            intents = []  # best-effort; don't fail the load
+        _convert_excel_dates(name, intents)
     if opts.materialize and opts.nullify_tokens:
         _nullify_string_tokens(name, opts.nullify_tokens)
     if opts.materialize:
@@ -739,12 +744,12 @@ def _detect_end_col_on_row(path: Path, sheet: str | None,
     start_idx = _col_index_from_letter(start_col)
     wb = openpyxl.load_workbook(filename=str(path), read_only=True, data_only=True)
     try:
-        ws = wb[sheet] if sheet else wb.active
-        # Scan a generous block; openpyxl iter_rows is lazy so this
-        # is cheap even for very wide sheets.
+        # Match DuckDB's first-sheet default (wb.active may differ).
+        ws = wb[sheet] if sheet else wb.worksheets[0]
+        scan_max = _scan_col_bound(ws)
         rightmost = start_idx
         for row in ws.iter_rows(min_row=header_row, max_row=header_row,
-                                min_col=1, max_col=16384, values_only=True):
+                                min_col=1, max_col=scan_max, values_only=True):
             for j, v in enumerate(row, start=1):
                 if v is not None and str(v) != '':
                     if j > rightmost:
@@ -753,6 +758,159 @@ def _detect_end_col_on_row(path: Path, sheet: str | None,
         return _col_letter(rightmost)
     finally:
         wb.close()
+
+
+def _scan_col_bound(ws, hard_cap: int = 1024) -> int:
+    """Column upper bound from ws.max_column, capped to defend against
+    stale or 16384-default <dimension> tags."""
+    try:
+        mx = ws.max_column or 0
+    except Exception:
+        mx = 0
+    if mx <= 0 or mx > hard_cap:
+        return hard_cap
+    return int(mx)
+
+
+def _detect_excel_column_intents(path: Path, sheet: str | None,
+                                 header_row: int, start_col: str,
+                                 end_col: str | None,
+                                 nullify_tokens: list[str] | None = None,
+                                 sample_rows: int = 200) -> list[dict]:
+    """Classify each column in [start_col..end_col] by openpyxl
+    number_format: 'date', 'datetime', 'time', or '' for mixed/none.
+    Needs ≥80% of non-null sampled cells to agree.  Cells whose string
+    value is in ``nullify_tokens`` are skipped so a mostly-'NULL'
+    column with one real date still gets classified."""
+    import openpyxl
+    nullset = set(nullify_tokens or ())
+    start_idx = _col_index_from_letter(start_col)
+    wb = openpyxl.load_workbook(filename=str(path), read_only=True, data_only=True)
+    try:
+        # Match DuckDB's first-sheet default (wb.active may differ).
+        ws = wb[sheet] if sheet else wb.worksheets[0]
+        end_idx = (_col_index_from_letter(end_col)
+                   if end_col else _scan_col_bound(ws))
+        if end_idx < start_idx:
+            end_idx = start_idx
+        data_start = header_row + 1
+        data_end = data_start + sample_rows - 1
+
+        tally: dict[int, dict[str, int]] = {}
+        for row in ws.iter_rows(min_row=data_start, max_row=data_end,
+                                min_col=start_idx, max_col=end_idx):
+            for cell in row:
+                v = cell.value
+                if v is None or v == '':
+                    continue
+                if isinstance(v, str) and v in nullset:
+                    continue
+                t = tally.setdefault(cell.column, {
+                    'date': 0, 'datetime': 0, 'time': 0, 'total': 0
+                })
+                t['total'] += 1
+                kind = _classify_excel_format(cell.number_format or '')
+                if kind in ('date', 'datetime', 'time'):
+                    t[kind] += 1
+    finally:
+        wb.close()
+
+    out: list[dict] = []
+    for col_idx in range(start_idx, end_idx + 1):
+        t = tally.get(col_idx)
+        intent = ''
+        if t and t['total'] > 0:
+            # Datetime wins ties as the more specific form.
+            best = max(('datetime', 'date', 'time'), key=lambda k: t[k])
+            if t[best] >= max(1, int(t['total'] * 0.8)):
+                intent = best
+        out.append({'index': col_idx, 'letter': _col_letter(col_idx), 'intent': intent})
+    return out
+
+
+def _classify_excel_format(fmt: str) -> str:
+    """Excel number_format → 'date' | 'datetime' | 'time' | 'other'.
+    `m` is ambiguous (month vs minute), so we only look at unambiguous
+    tokens once is_date_format confirms it's some kind of date/time."""
+    from openpyxl.styles.numbers import is_date_format
+    if not fmt:
+        return 'other'
+    low = fmt.lower().strip()
+    if low in ('', 'general'):
+        return 'other'
+    if not is_date_format(fmt):
+        return 'other'
+    # Drop bracketed sections (`[h]`, `[$-409]`) and quoted literals.
+    stripped = re.sub(r'\[[^\]]*\]', '', low)
+    stripped = re.sub(r'"[^"]*"', '', stripped)
+    has_date = 'y' in stripped or 'd' in stripped or 'mmm' in stripped
+    has_time = 'h' in stripped or 's' in stripped or 'am/pm' in low or 'a/p' in low
+    if has_date and has_time:
+        return 'datetime'
+    if has_date:
+        return 'date'
+    if has_time:
+        return 'time'
+    return 'date'  # is_date_format true but no unambiguous tokens
+
+
+def _convert_excel_dates(table_name: str, intents: list[dict]) -> None:
+    """Rewrite Excel date serials to ISO strings in intent-flagged columns.
+
+    Intent gates the column; the per-cell branch is picked by value
+    range, because Excel format strings can lie (a `mmss.0`-formatted
+    column may still carry full datetime serials, so we trust the value):
+
+      integer in [367, 73415]               → date (1901..2100)
+      fractional in [367, 73415]            → datetime
+      fraction in [0, 1), time-intent only  → time-of-day
+      else                                  → unchanged
+
+    Excel epoch is 1899-12-30 (the 1900 leap-year quirk).  try_cast
+    leaves non-numeric cells alone."""
+    if not intents:
+        return
+    c = db.conn()
+    qname = db.quote_ident(table_name)
+    cols = c.execute(f"""
+        pragma table_info({qname})
+        ;
+    """).fetchall()
+    # Pair intents to data columns by position; skip the prepended ROW_NUM.
+    data_cols = [r[1] for r in cols if r[1] != ROW_NUM_COLUMN]
+    for i, info in enumerate(intents):
+        if i >= len(data_cols):
+            break
+        intent = info.get('intent') or ''
+        if intent not in ('date', 'datetime', 'time'):
+            continue
+        qcol = db.quote_ident(data_cols[i])
+        as_dbl = f'try_cast({qcol} as double)'
+        date_expr = (f"strftime(date '1899-12-30' "
+                     f"+ cast(floor({as_dbl}) as integer), '%Y-%m-%d')")
+        dt_expr = (f"strftime(timestamp '1899-12-30' "
+                   f"+ to_microseconds(cast({as_dbl} * 86400000000 as bigint)), "
+                   f"'%Y-%m-%d %H:%M:%S')")
+        # strftime() doesn't accept TIME; cast straight to varchar.
+        time_expr = (f"cast(time '00:00:00' "
+                     f"+ to_microseconds(cast({as_dbl} * 86400000000 as bigint)) "
+                     f"as varchar)")
+        # Time branch gated on intent so stray 0.5s in date columns
+        # don't render as 12:00:00.
+        time_branch = (f"when {as_dbl} >= 0 and {as_dbl} < 1 then {time_expr}"
+                       if intent == 'time' else '')
+        c.execute(f"""
+            update  {qname}
+            set     {qcol} = case
+                                when {as_dbl} between 367 and 73415
+                                 and {as_dbl} = floor({as_dbl})       then {date_expr}
+                                when {as_dbl} between 367 and 73415   then {dt_expr}
+                                {time_branch}
+                                else                                       {qcol}
+                             end
+            where   {qcol} is not null
+            ;
+        """)
 
 
 def _col_index_from_letter(letter: str) -> int:
@@ -776,9 +934,12 @@ def _col_letter(idx: int) -> str:
     return out
 
 
-def _excel_sheet_preview(ws, max_rows: int = 30, max_cols: int = 30) -> tuple[list[list[str]], int, int, int]:
+def _excel_sheet_preview(ws, max_rows: int = 30, preview_col_cap: int = 200) -> tuple[list[list[str]], int, int, int]:
     """Read a sample of the top-left of ``ws`` and return:
     ``(preview_grid, header_row, start_col, end_col)`` (all 1-based).
+
+    Column extent comes from ws.max_column (capped) so wide sheets
+    expose every column instead of getting clipped at 30.
 
     Auto-detect strategy:
       * Walk the sample looking for the row with the highest density
@@ -790,6 +951,7 @@ def _excel_sheet_preview(ws, max_rows: int = 30, max_cols: int = 30) -> tuple[li
         empty cells on that same row.
       * If nothing looks data-shaped, default to (1, 1, 1).
     """
+    max_cols = _scan_col_bound(ws, hard_cap=preview_col_cap)
     preview: list[list[str]] = []
     for row in ws.iter_rows(min_row=1, max_row=max_rows,
                             min_col=1, max_col=max_cols,
