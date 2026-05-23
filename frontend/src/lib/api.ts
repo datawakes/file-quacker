@@ -43,6 +43,9 @@ export interface IngestOptions {
   excel_header_row?: number | null
   excel_start_col?: string | null
   excel_end_col?: string | null
+  /** Cell values matched here become real NULLs after load.
+   *  Case-sensitive.  Set to an empty array to disable nullification. */
+  nullify_tokens?: string[] | null
 }
 
 export interface ExcelSheetInfo {
