@@ -123,11 +123,17 @@ class FieldSpec:
     fancy gets handled at the driver level."""
     key: str                     # form field name; round-tripped in conn dict
     label: str                   # human-readable
-    kind: Literal['text', 'password', 'number', 'select']
+    kind: Literal['text', 'password', 'number', 'select', 'checkbox']
     required: bool = True
     default: Any = None
     placeholder: str | None = None
     options: list[str] | None = None  # for kind='select'
+    # When True (or when kind == 'password'), this field is a *secret*:
+    # the credential service stores it in the OS vault (keyring) instead
+    # of the plaintext connections.json.  Lets a driver mark non-password
+    # secrets (API keys, tokens, key passphrases) without the credential
+    # layer knowing anything driver-specific.
+    secret: bool = False
 
 
 @runtime_checkable
