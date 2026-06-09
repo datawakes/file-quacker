@@ -13,6 +13,7 @@ import {
   testSqlServerConnection,
   type SqlServerConnectionOptions,
 } from '../../lib/api'
+import ConnectionProfileBar from '../ConnectionProfileBar.vue'
 
 // --- props --------------------------------------------------------------- //
 defineProps<{
@@ -24,6 +25,19 @@ const conn     = defineModel<SqlServerConnectionOptions>('conn',     { required:
 const schema   = defineModel<string>('schema',   { required: true })
 const table    = defineModel<string>('table',    { required: true })
 const ifExists = defineModel<'fail' | 'drop' | 'append'>('ifExists', { required: true })
+const profileId = defineModel<string | null>('profileId', { default: null })
+
+// The profile bar mutates conn in place; it takes a generic record, so
+// expose the same object under a structural-record type (same reference,
+// so writes propagate back to `conn`).
+const connRecord = computed(() => conn.value as unknown as Record<string, unknown>)
+// Char count per saved secret field (set by the bar); drives the masked
+// placeholder dots on the blank password input.
+const secretLengths = ref<Record<string, number>>({})
+const passwordPlaceholder = computed(() => {
+  const n = secretLengths.value['password'] ?? 0
+  return n > 0 ? '•'.repeat(n) : ''
+})
 
 // --- local state --------------------------------------------------------- //
 const testState          = ref<{ kind: 'idle' | 'busy' | 'ok' | 'err'; message?: string }>({ kind: 'idle' })
@@ -58,6 +72,7 @@ function onPasswordEnter() {
 const credsFilled = computed(() => {
   if (!conn.value.server) return false
   if (conn.value.auth === 'windows') return true
+  if (profileId.value) return true            // secret resolved backend-side
   return !!(conn.value.username && conn.value.password)
 })
 
@@ -83,7 +98,7 @@ watch(() => conn.value.database, async (db) => {
     return
   }
   try {
-    const schemas = await listSqlServerSchemas(conn.value)
+    const schemas = await listSqlServerSchemas(conn.value, profileId.value)
     availableSchemas.value = schemas
     if (!schemas.includes(schema.value)) {
       schema.value = schemas.includes('dbo') ? 'dbo' : (schemas[0] ?? '')
@@ -97,7 +112,7 @@ watch(() => conn.value.database, async (db) => {
 async function onTest() {
   testState.value = { kind: 'busy' }
   try {
-    const t = await testSqlServerConnection(conn.value)
+    const t = await testSqlServerConnection(conn.value, profileId.value)
     if (!t.ok) {
       testState.value          = { kind: 'err', message: t.error ?? 'connection failed' }
       availableDatabases.value = null
@@ -105,14 +120,14 @@ async function onTest() {
       return
     }
     testState.value = { kind: 'ok', message: t.server_version }
-    const dbs = await listSqlServerDatabases(conn.value)
+    const dbs = await listSqlServerDatabases(conn.value, profileId.value)
     availableDatabases.value = dbs
     // Keep the current db if it's in the list; otherwise pick one.
     if (!conn.value.database || !dbs.includes(conn.value.database)) {
       conn.value.database = dbs[0] ?? ''
     } else {
       // Trigger schema list refresh even though db value didn't change.
-      const schemas = await listSqlServerSchemas(conn.value)
+      const schemas = await listSqlServerSchemas(conn.value, profileId.value)
       availableSchemas.value = schemas
       if (!schemas.includes(schema.value)) {
         schema.value = schemas.includes('dbo') ? 'dbo' : (schemas[0] ?? '')
@@ -128,6 +143,14 @@ async function onTest() {
 
 <template>
   <section class="shrink-0 border-b border-border p-3">
+    <ConnectionProfileBar
+      v-if="!driverMissing"
+      driver-id="sqlserver"
+      :conn-opts="connRecord"
+      label-width="80px"
+      v-model:profile-id="profileId"
+      v-model:secret-lengths="secretLengths"
+    />
     <div
       class="grid gap-x-3 gap-y-1.5 text-xs"
       style="grid-template-columns: 80px minmax(0, 1fr) 32px 80px minmax(0, 1fr);"
@@ -196,6 +219,7 @@ async function onTest() {
         <label class="self-center text-ink-muted">Password</label>
         <input ref="passwordRef" v-model="conn.password"
           type="password"
+          :placeholder="passwordPlaceholder"
           :disabled="driverMissing" autocomplete="off"
           @keydown.enter="onPasswordEnter"
           class="h-7 rounded border border-border bg-surface-0 px-2 font-mono outline-none focus:border-accent disabled:opacity-50" />

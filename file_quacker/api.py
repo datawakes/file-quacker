@@ -19,6 +19,7 @@ import webview
 
 from . import (
     __version__,
+    credentials,
     db,
     ddl as ddl_mod,
     derive,
@@ -399,6 +400,7 @@ class Api:
                         'key': f.key, 'label': f.label, 'kind': f.kind,
                         'required': f.required, 'default': f.default,
                         'placeholder': f.placeholder, 'options': f.options,
+                        'secret': f.kind == 'password' or getattr(f, 'secret', False),
                     }
                     for f in d.connection_form
                 ],
@@ -409,33 +411,43 @@ class Api:
         from . import drivers
         return drivers.driver_for(driver_id).is_available()
 
-    def driver_test_connection(self, driver_id: str, conn_opts: dict) -> dict:
+    def driver_test_connection(self, driver_id: str, conn_opts: dict,
+                               profile_id: str | None = None) -> dict:
         from . import drivers
+        conn_opts = _resolve_conn_opts(driver_id, conn_opts, profile_id)
         d = drivers.driver_for(driver_id)
         return d.test_connection(conn_opts)                          # type: ignore[attr-defined]
 
-    def driver_list_databases(self, driver_id: str, conn_opts: dict) -> list[str]:
+    def driver_list_databases(self, driver_id: str, conn_opts: dict,
+                              profile_id: str | None = None) -> list[str]:
         from . import drivers
+        conn_opts = _resolve_conn_opts(driver_id, conn_opts, profile_id)
         return drivers.driver_for(driver_id).list_databases(conn_opts)
 
-    def driver_list_schemas(self, driver_id: str, conn_opts: dict, database: str) -> list[str]:
+    def driver_list_schemas(self, driver_id: str, conn_opts: dict, database: str,
+                            profile_id: str | None = None) -> list[str]:
         from . import drivers
+        conn_opts = _resolve_conn_opts(driver_id, conn_opts, profile_id)
         return drivers.driver_for(driver_id).list_schemas(conn_opts, database)
 
     def driver_list_tables(self, driver_id: str, conn_opts: dict,
-                           database: str, schema: str) -> list[dict]:
+                           database: str, schema: str,
+                           profile_id: str | None = None) -> list[dict]:
         from . import drivers
+        conn_opts = _resolve_conn_opts(driver_id, conn_opts, profile_id)
         return drivers.driver_for(driver_id).list_tables(conn_opts, database, schema)
 
     def driver_import_from_db(self, driver_id: str, conn_opts: dict,
                               source: dict, target_name: str,
-                              row_cap: int | None = 1_000_000) -> dict:
+                              row_cap: int | None = 1_000_000,
+                              profile_id: str | None = None) -> dict:
         """Stream a remote table or query into a DuckDB workspace
         table.  ``source`` shape:
             {'kind': 'table', 'database': str, 'schema': str, 'table': str}
             {'kind': 'query', 'database': str|None, 'sql': str}
         Pass ``row_cap=None`` (or 0) to disable the safety cap."""
         from . import drivers
+        conn_opts = _resolve_conn_opts(driver_id, conn_opts, profile_id)
         d = drivers.driver_for(driver_id)
         kind = source.get('kind', 'table')
         return d.import_table(                                       # type: ignore[attr-defined]
@@ -454,18 +466,55 @@ class Api:
         return {'ok': True}
 
     # --------------------------------------------------------------------- #
+    # Saved connection profiles (shared resource across all drivers)        #
+    # --------------------------------------------------------------------- #
+    def list_connection_profiles(self, driver_id: str | None = None) -> list[dict]:
+        """Saved profiles (no secrets in the payload).  ``has_secret``
+        flags whether a password is on file.  Pass ``driver_id`` to
+        filter to the active driver."""
+        return credentials.list_profiles(driver_id)
+
+    def get_connection_profile(self, profile_id: str) -> dict | None:
+        """Non-secret conn_opts + ``has_secret`` for populating the form
+        when the user selects a saved profile."""
+        return credentials.get(profile_id)
+
+    def save_connection_profile(self, name: str, driver_id: str, conn_opts: dict,
+                                save_secret: bool = True) -> dict:
+        """Persist a named profile.  Secret fields (per the driver's form)
+        go to the OS vault; everything else to ``connections.json``.
+        ``save_secret=False`` saves metadata only (password typed each
+        use).  Never echoes the secret back."""
+        try:
+            return credentials.save(driver_id, name, conn_opts, save_secret=save_secret)
+        except OSError as ex:
+            return {'ok': False, 'error': f'Could not save profile: {ex}'}
+
+    def delete_connection_profile(self, profile_id: str) -> dict:
+        try:
+            return {'ok': credentials.delete(profile_id)}
+        except OSError as ex:
+            return {'ok': False, 'error': str(ex)}
+
+    # --------------------------------------------------------------------- #
     # SQL Server export                                                     #
     # --------------------------------------------------------------------- #
     def check_odbc_driver(self) -> dict:
         return export_mod.check_odbc_driver()
 
-    def test_sqlserver_connection(self, conn_opts: dict) -> dict:
+    def test_sqlserver_connection(self, conn_opts: dict,
+                                  profile_id: str | None = None) -> dict:
+        conn_opts = _resolve_conn_opts('sqlserver', conn_opts, profile_id)
         return export_mod.test_connection(export_mod.ConnectionOptions(**conn_opts))
 
-    def list_sqlserver_databases(self, conn_opts: dict) -> list[str]:
+    def list_sqlserver_databases(self, conn_opts: dict,
+                                 profile_id: str | None = None) -> list[str]:
+        conn_opts = _resolve_conn_opts('sqlserver', conn_opts, profile_id)
         return export_mod.list_databases(export_mod.ConnectionOptions(**conn_opts))
 
-    def list_sqlserver_schemas(self, conn_opts: dict) -> list[str]:
+    def list_sqlserver_schemas(self, conn_opts: dict,
+                               profile_id: str | None = None) -> list[str]:
+        conn_opts = _resolve_conn_opts('sqlserver', conn_opts, profile_id)
         return export_mod.list_schemas(export_mod.ConnectionOptions(**conn_opts))
 
     def suggest_export_mappings(self, source: dict,
@@ -475,7 +524,9 @@ class Api:
     def preview_export_ddl(self, export_opts: dict) -> dict:
         return {'sql': export_mod.preview_ddl(export_mod.ExportOptions(**export_opts))}
 
-    def export_to_sqlserver(self, conn_opts: dict, export_opts: dict) -> dict:
+    def export_to_sqlserver(self, conn_opts: dict, export_opts: dict,
+                            profile_id: str | None = None) -> dict:
+        conn_opts = _resolve_conn_opts('sqlserver', conn_opts, profile_id)
         return export_mod.export_to_sqlserver(
             export_mod.ConnectionOptions(**conn_opts),
             export_mod.ExportOptions(**export_opts),
@@ -513,3 +564,25 @@ def _json_safe(v: Any) -> Any:
     if v is None or isinstance(v, (int, float, bool, str)):
         return v
     return str(v)
+
+
+def _resolve_conn_opts(driver_id: str, conn_opts: dict,
+                       profile_id: str | None) -> dict:
+    """Backend-side secret resolution for saved connection profiles.
+
+    When ``profile_id`` is set, load the stored conn_opts and merge the
+    vault secret in here — so the password never has to round-trip to the
+    frontend.  Any non-empty field the frontend *did* send overrides the
+    stored value, which lets the user tweak host/database or override the
+    saved password for a single session.  No profile (or an unknown id)
+    falls through to the conn_opts as sent, preserving today's behavior.
+    """
+    if not profile_id:
+        return conn_opts
+    resolved = credentials.resolve(profile_id)
+    if resolved is None:
+        return conn_opts
+    for k, v in (conn_opts or {}).items():
+        if v not in (None, ''):
+            resolved[k] = v
+    return resolved

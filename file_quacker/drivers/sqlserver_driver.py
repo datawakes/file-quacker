@@ -35,8 +35,7 @@ _FORM: list[FieldSpec] = [
               options=['sql', 'windows']),
     FieldSpec('username',  'Username',     'text',     required=False),
     FieldSpec('password',  'Password',     'password', required=False),
-    FieldSpec('azure',     'Azure SQL',    'select',   default='no',
-              options=['no', 'yes']),
+    FieldSpec('azure',     'Azure SQL',    'checkbox', required=False, default=False),
     FieldSpec('database',  'Database',     'text',    required=False),
 ]
 

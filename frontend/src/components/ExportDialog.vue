@@ -74,6 +74,9 @@ const conn = ref<SqlServerConnectionOptions>({
 const schema = ref('dbo')
 const tableName = ref(props.source.kind === 'table' ? (props.source.name ?? '') : 'query_export')
 const ifExists = ref<'fail' | 'drop' | 'append'>('fail')
+// Saved-connection profile (if the user picked one in the pane); passed
+// to export so the backend resolves the secret server-side.
+const profileId = ref<string | null>(null)
 
 // --- mapping rows ---------------------------------------------------- //
 interface Row extends ExportColumnMapping { source_type: string }
@@ -220,7 +223,7 @@ async function onExportSqlServer() {
     chunk_no: 0, chunk_rows: 0, last_chunk_ms: 0, elapsed_ms: 0, error: null }
   startPolling()
   try {
-    const r = await exportToSqlServer(conn.value, buildExportOpts())
+    const r = await exportToSqlServer(conn.value, buildExportOpts(), profileId.value)
     lastResult.value = r
     progress.value = await getExportProgress()
     if (r.ok) {
@@ -294,7 +297,8 @@ async function onCancelExport() {
 const driverMissing = computed(() => driverCheck.value !== null && !driverCheck.value.ok)
 const connectionFilled = computed(() => {
   if (!conn.value.server) return false
-  if (conn.value.auth !== 'windows' && !(conn.value.username && conn.value.password)) return false
+  // A saved profile supplies the secret backend-side, so blank creds are OK.
+  if (conn.value.auth !== 'windows' && !profileId.value && !(conn.value.username && conn.value.password)) return false
   return !!conn.value.database
 })
 const canExport = computed(() => {
@@ -454,6 +458,7 @@ const fileOperationPreview = computed(() => {
           v-model:schema="schema"
           v-model:table="tableName"
           v-model:ifExists="ifExists"
+          v-model:profileId="profileId"
           :driver-missing="driverMissing"
         />
         <FileTargetPane

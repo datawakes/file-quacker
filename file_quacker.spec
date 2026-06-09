@@ -6,7 +6,7 @@
 import re
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 from PyInstaller.utils.win32.versioninfo import (
     FixedFileInfo,
     StringFileInfo,
@@ -78,9 +78,22 @@ a = Analysis(
     datas=[
         (str(PROJECT_ROOT / 'frontend' / 'dist'), 'dist'),
         (str(PROJECT_ROOT / 'file_quacker.ico'), '.'),
+        # keyring discovers its backends via importlib metadata entry
+        # points, which PyInstaller's static analysis can't see; ship the
+        # dist-info so the Windows Credential Manager backend resolves in
+        # the frozen exe instead of silently falling back to a no-op.
+        *copy_metadata('keyring'),
         *pywebview_datas,
     ],
-    hiddenimports=['duckdb', 'chardet', *pywebview_hiddenimports],
+    # keyring.backends.Windows + its pywin32-ctypes shim are imported
+    # dynamically; name them explicitly so the vault works when bundled.
+    hiddenimports=[
+        'duckdb', 'chardet',
+        'keyring.backends.Windows',
+        'win32ctypes.core',
+        'win32ctypes.core.ctypes',
+        *pywebview_hiddenimports,
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

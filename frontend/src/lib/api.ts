@@ -217,11 +217,44 @@ export interface SqlServerConnectionOptions {
 export interface DriverFieldSpec {
   key: string
   label: string
-  kind: 'text' | 'password' | 'number' | 'select'
+  kind: 'text' | 'password' | 'number' | 'select' | 'checkbox'
   required: boolean
   default: unknown
   placeholder: string | null
   options: string[] | null
+  /** True for fields stored in the OS vault (password / token / key),
+   *  never in connections.json.  Drives the "saved" affordance. */
+  secret: boolean
+}
+
+// --- saved connection profiles (shared across drivers) --------------- //
+export interface ConnectionProfile {
+  id: string
+  name: string
+  driver_id: string
+  /** Whether a password/secret is on file in the OS vault. */
+  has_secret: boolean
+}
+
+export interface ConnectionProfileDetail extends ConnectionProfile {
+  /** Non-secret fields only; the secret is resolved backend-side at use. */
+  conn_opts: Record<string, unknown>
+  /** Char count per saved secret field (not the value) — for masked
+   *  placeholder dots of the right length. */
+  secret_lengths: Record<string, number>
+}
+
+export interface SaveProfileResult {
+  id?: string
+  name?: string
+  driver_id?: string
+  has_secret?: boolean
+  /** Char count per saved secret field after the save (reflects preserved
+   *  secrets), for the masked placeholder. */
+  secret_lengths?: Record<string, number>
+  /** Present only on failure (e.g. unwritable profile dir). */
+  ok?: boolean
+  error?: string
 }
 
 export interface DriverInfo {
@@ -370,14 +403,15 @@ interface PywebviewApi {
   auto_derive(source_table: string, new_name: string): Promise<DeriveCreated>
   generate_ddl(table_name: string, dialect: 'duckdb' | 'sqlserver'): Promise<{ sql: string }>
   check_odbc_driver(): Promise<OdbcDriverCheck>
-  test_sqlserver_connection(conn_opts: SqlServerConnectionOptions): Promise<{ ok: boolean; server_version?: string; error?: string }>
-  list_sqlserver_databases(conn_opts: SqlServerConnectionOptions): Promise<string[]>
-  list_sqlserver_schemas(conn_opts: SqlServerConnectionOptions): Promise<string[]>
+  test_sqlserver_connection(conn_opts: SqlServerConnectionOptions, profile_id?: string | null): Promise<{ ok: boolean; server_version?: string; error?: string }>
+  list_sqlserver_databases(conn_opts: SqlServerConnectionOptions, profile_id?: string | null): Promise<string[]>
+  list_sqlserver_schemas(conn_opts: SqlServerConnectionOptions, profile_id?: string | null): Promise<string[]>
   suggest_export_mappings(source: ExportSource, trim_strings?: boolean): Promise<ExportMappingSuggestion[]>
   preview_export_ddl(export_opts: SqlServerExportOptions): Promise<{ sql: string }>
   export_to_sqlserver(
     conn_opts: SqlServerConnectionOptions,
     export_opts: SqlServerExportOptions,
+    profile_id?: string | null,
   ): Promise<ExportResult>
   cancel_export(): Promise<{ cancelled: boolean }>
   get_export_progress(): Promise<ExportProgress>
@@ -387,12 +421,18 @@ interface PywebviewApi {
   list_dialects(): Promise<{ id: string; display_name: string }[]>
   list_drivers(): Promise<DriverInfo[]>
   driver_is_available(driver_id: string): Promise<{ ok: boolean; [k: string]: unknown }>
-  driver_test_connection(driver_id: string, conn_opts: Record<string, unknown>): Promise<{ ok: boolean; server_version?: string; error?: string }>
-  driver_list_databases(driver_id: string, conn_opts: Record<string, unknown>): Promise<string[]>
-  driver_list_schemas(driver_id: string, conn_opts: Record<string, unknown>, database: string): Promise<string[]>
-  driver_list_tables(driver_id: string, conn_opts: Record<string, unknown>, database: string, schema: string): Promise<RemoteTable[]>
-  driver_import_from_db(driver_id: string, conn_opts: Record<string, unknown>, source: ImportSource, target_name: string, row_cap?: number | null): Promise<IngestResult & { ok: boolean; elapsed_ms: number; error?: string }>
+  driver_test_connection(driver_id: string, conn_opts: Record<string, unknown>, profile_id?: string | null): Promise<{ ok: boolean; server_version?: string; error?: string }>
+  driver_list_databases(driver_id: string, conn_opts: Record<string, unknown>, profile_id?: string | null): Promise<string[]>
+  driver_list_schemas(driver_id: string, conn_opts: Record<string, unknown>, database: string, profile_id?: string | null): Promise<string[]>
+  driver_list_tables(driver_id: string, conn_opts: Record<string, unknown>, database: string, schema: string, profile_id?: string | null): Promise<RemoteTable[]>
+  driver_import_from_db(driver_id: string, conn_opts: Record<string, unknown>, source: ImportSource, target_name: string, row_cap?: number | null, profile_id?: string | null): Promise<IngestResult & { ok: boolean; elapsed_ms: number; error?: string }>
   driver_cancel_import(driver_id: string): Promise<{ ok: boolean }>
+
+  // Saved connection profiles (shared resource across drivers)
+  list_connection_profiles(driver_id?: string | null): Promise<ConnectionProfile[]>
+  get_connection_profile(profile_id: string): Promise<ConnectionProfileDetail | null>
+  save_connection_profile(name: string, driver_id: string, conn_opts: Record<string, unknown>, save_secret?: boolean): Promise<SaveProfileResult>
+  delete_connection_profile(profile_id: string): Promise<{ ok: boolean; error?: string }>
 }
 
 declare global {
@@ -471,13 +511,13 @@ export const generateDdl      = (t: string, dialect: 'duckdb' | 'sqlserver') => 
 
 // --- SQL Server export ------------------------------------------- //
 export const checkOdbcDriver         = ()                                 => withApi(a => a.check_odbc_driver())
-export const testSqlServerConnection = (o: SqlServerConnectionOptions)    => withApi(a => a.test_sqlserver_connection(o))
-export const listSqlServerDatabases  = (o: SqlServerConnectionOptions)    => withApi(a => a.list_sqlserver_databases(o))
-export const listSqlServerSchemas    = (o: SqlServerConnectionOptions)    => withApi(a => a.list_sqlserver_schemas(o))
+export const testSqlServerConnection = (o: SqlServerConnectionOptions, profileId?: string | null)    => withApi(a => a.test_sqlserver_connection(o, profileId))
+export const listSqlServerDatabases  = (o: SqlServerConnectionOptions, profileId?: string | null)    => withApi(a => a.list_sqlserver_databases(o, profileId))
+export const listSqlServerSchemas    = (o: SqlServerConnectionOptions, profileId?: string | null)    => withApi(a => a.list_sqlserver_schemas(o, profileId))
 export const suggestExportMappings   = (src: ExportSource, trimStrings?: boolean) => withApi(a => a.suggest_export_mappings(src, trimStrings))
 export const previewExportDdl        = (e: SqlServerExportOptions)        => withApi(a => a.preview_export_ddl(e))
-export const exportToSqlServer       = (c: SqlServerConnectionOptions, e: SqlServerExportOptions) =>
-  withApi(a => a.export_to_sqlserver(c, e))
+export const exportToSqlServer       = (c: SqlServerConnectionOptions, e: SqlServerExportOptions, profileId?: string | null) =>
+  withApi(a => a.export_to_sqlserver(c, e, profileId))
 export const cancelExport            = ()                                 => withApi(a => a.cancel_export())
 export const getExportProgress       = ()                                 => withApi(a => a.get_export_progress())
 
@@ -491,10 +531,17 @@ export const cancelFileExport      = ()                                  => with
 export const listDialects          = ()                                  => withApi(a => a.list_dialects())
 export const listDrivers           = ()                                  => withApi(a => a.list_drivers())
 export const driverIsAvailable     = (id: string)                        => withApi(a => a.driver_is_available(id))
-export const driverTestConnection  = (id: string, c: Record<string, unknown>) => withApi(a => a.driver_test_connection(id, c))
-export const driverListDatabases   = (id: string, c: Record<string, unknown>) => withApi(a => a.driver_list_databases(id, c))
-export const driverListSchemas     = (id: string, c: Record<string, unknown>, db: string) => withApi(a => a.driver_list_schemas(id, c, db))
-export const driverListTables      = (id: string, c: Record<string, unknown>, db: string, schema: string) => withApi(a => a.driver_list_tables(id, c, db, schema))
-export const driverImportFromDb    = (id: string, c: Record<string, unknown>, src: ImportSource, target: string, rowCap: number | null = 1_000_000) =>
-  withApi(a => a.driver_import_from_db(id, c, src, target, rowCap))
+export const driverTestConnection  = (id: string, c: Record<string, unknown>, profileId?: string | null) => withApi(a => a.driver_test_connection(id, c, profileId))
+export const driverListDatabases   = (id: string, c: Record<string, unknown>, profileId?: string | null) => withApi(a => a.driver_list_databases(id, c, profileId))
+export const driverListSchemas     = (id: string, c: Record<string, unknown>, db: string, profileId?: string | null) => withApi(a => a.driver_list_schemas(id, c, db, profileId))
+export const driverListTables      = (id: string, c: Record<string, unknown>, db: string, schema: string, profileId?: string | null) => withApi(a => a.driver_list_tables(id, c, db, schema, profileId))
+export const driverImportFromDb    = (id: string, c: Record<string, unknown>, src: ImportSource, target: string, rowCap: number | null = 1_000_000, profileId?: string | null) =>
+  withApi(a => a.driver_import_from_db(id, c, src, target, rowCap, profileId))
 export const driverCancelImport    = (id: string)                        => withApi(a => a.driver_cancel_import(id))
+
+// Saved connection profiles (shared resource across drivers)
+export const listConnectionProfiles  = (driverId?: string | null)        => withApi(a => a.list_connection_profiles(driverId))
+export const getConnectionProfile    = (id: string)                      => withApi(a => a.get_connection_profile(id))
+export const saveConnectionProfile   = (name: string, driverId: string, connOpts: Record<string, unknown>, saveSecret = true) =>
+  withApi(a => a.save_connection_profile(name, driverId, connOpts, saveSecret))
+export const deleteConnectionProfile = (id: string)                      => withApi(a => a.delete_connection_profile(id))

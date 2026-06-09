@@ -19,6 +19,7 @@ import { useFocusTrap } from '../composables/useFocusTrap'
 
 const dialogRef = ref<HTMLElement | null>(null)
 useFocusTrap(dialogRef)
+import ConnectionProfileBar from './ConnectionProfileBar.vue'
 import {
   driverCancelImport,
   driverImportFromDb,
@@ -59,6 +60,22 @@ const activeDriver = computed(() =>
 const importConnectionFields = computed(() =>
   (activeDriver.value?.connection_form ?? []).filter(f => f.key !== 'database'),
 )
+// Vault-backed field keys for this driver (drives the profile bar's
+// "clear on select" + the Save-password affordance).
+const secretKeys = computed(() =>
+  (activeDriver.value?.connection_form ?? []).filter(f => f.secret).map(f => f.key),
+)
+// Active saved profile, if any.  Passed through every connection call so
+// the backend resolves the secret server-side (it never reaches here).
+const activeProfileId = ref<string | null>(null)
+// Char count per saved secret field for the active profile; drives the
+// masked placeholder dots on the (intentionally blank) password input.
+const profileSecretLengths = ref<Record<string, number>>({})
+
+function maskedPlaceholder(f: DriverFieldSpec): string {
+  const n = f.kind === 'password' ? (profileSecretLengths.value[f.key] ?? 0) : 0
+  return n > 0 ? '•'.repeat(n) : (f.placeholder ?? '')
+}
 async function loadDrivers() {
   try {
     drivers.value = await listDrivers()
@@ -77,6 +94,7 @@ watch(activeDriver, (d) => {
   const next: Record<string, unknown> = {}
   for (const f of d?.connection_form ?? []) next[f.key] = f.default ?? ''
   connOpts.value = next
+  activeProfileId.value = null            // selection doesn't carry across drivers
 }, { immediate: true })
 
 watch(importDb, (open) => {
@@ -115,10 +133,10 @@ async function onTest() {
   testing.value = true
   testResult.value = null
   try {
-    const r = await driverTestConnection(driverId.value, connOpts.value)
+    const r = await driverTestConnection(driverId.value, connOpts.value, activeProfileId.value)
     if (r.ok) {
       testResult.value = { ok: true, message: r.server_version || 'connected' }
-      databases.value = await driverListDatabases(driverId.value, connOpts.value)
+      databases.value = await driverListDatabases(driverId.value, connOpts.value, activeProfileId.value)
     } else {
       testResult.value = { ok: false, message: r.error || 'connection failed' }
     }
@@ -136,7 +154,7 @@ watch(pickedDatabase, async (db) => {
   pickedTable.value = ''
   if (!db || !driverId.value) return
   try {
-    schemas.value = await driverListSchemas(driverId.value, connOpts.value, db)
+    schemas.value = await driverListSchemas(driverId.value, connOpts.value, db, activeProfileId.value)
     if (schemas.value.includes('dbo')) pickedSchema.value = 'dbo'
     else if (schemas.value.length === 1) pickedSchema.value = schemas.value[0]
   } catch (e) {
@@ -149,7 +167,7 @@ watch([pickedDatabase, pickedSchema], async ([db, schema]) => {
   pickedTable.value = ''
   if (!db || !schema || !driverId.value) return
   try {
-    remoteTables.value = await driverListTables(driverId.value, connOpts.value, db, schema)
+    remoteTables.value = await driverListTables(driverId.value, connOpts.value, db, schema, activeProfileId.value)
   } catch (e) {
     toasts.show(e instanceof Error ? e.message : String(e), 'error', 5000)
   }
@@ -226,7 +244,7 @@ async function onImport() {
 
   const toastId = toasts.showSticky(`Importing ${useQuery.value ? '(query)' : pickedTable.value}…`, 'info')
   try {
-    const r = await driverImportFromDb(driverId.value, opts, src, targetName.value, cap)
+    const r = await driverImportFromDb(driverId.value, opts, src, targetName.value, cap, activeProfileId.value)
     if (r.ok) {
       toasts.dismiss(toastId)
       const capped = r.has_rejects ? ` (capped at ${cap?.toLocaleString()})` : ''
@@ -301,11 +319,25 @@ function fieldType(f: DriverFieldSpec): string {
           <legend class="px-1 text-2xs uppercase tracking-wide text-ink-subtle">
             Connection
           </legend>
+          <ConnectionProfileBar
+            :driver-id="driverId"
+            :conn-opts="connOpts"
+            :secret-keys="secretKeys"
+            field-width="346px"
+            v-model:profile-id="activeProfileId"
+            v-model:secret-lengths="profileSecretLengths"
+          />
           <div class="grid gap-x-3 gap-y-1.5" style="grid-template-columns: 110px minmax(0, 1fr);">
             <template v-for="f in importConnectionFields" :key="f.key">
               <label class="self-center text-ink-muted">{{ f.label }}</label>
+              <input
+                v-if="f.kind === 'checkbox'"
+                type="checkbox"
+                v-model="connOpts[f.key]"
+                class="h-4 w-4 self-center justify-self-start"
+              />
               <select
-                v-if="f.kind === 'select'"
+                v-else-if="f.kind === 'select'"
                 v-model="connOpts[f.key]"
                 class="h-7 w-48 rounded border border-border bg-surface-0 px-2 outline-none focus:border-accent"
               >
@@ -314,9 +346,9 @@ function fieldType(f: DriverFieldSpec): string {
               <input
                 v-else
                 :type="fieldType(f)"
-                :placeholder="f.placeholder ?? ''"
+                :placeholder="maskedPlaceholder(f)"
                 v-model="connOpts[f.key]"
-                class="h-7 w-72 rounded border border-border bg-surface-0 px-2 font-mono outline-none focus:border-accent"
+                class="h-7 w-[346px] rounded border border-border bg-surface-0 px-2 font-mono outline-none focus:border-accent"
               />
             </template>
           </div>
@@ -358,7 +390,7 @@ function fieldType(f: DriverFieldSpec): string {
                 v-model="pickedDatabase"
                 class="h-7 w-72 rounded border border-border bg-surface-0 px-2 outline-none focus:border-accent"
               >
-                <option value="">— pick —</option>
+                <option value="">- pick -</option>
                 <option v-for="d in databases" :key="d" :value="d">{{ d }}</option>
               </select>
               <label class="self-center text-ink-muted">Schema</label>
@@ -366,15 +398,15 @@ function fieldType(f: DriverFieldSpec): string {
                 v-model="pickedSchema"
                 class="h-7 w-72 rounded border border-border bg-surface-0 px-2 outline-none focus:border-accent"
               >
-                <option value="">— pick —</option>
+                <option value="">- pick -</option>
                 <option v-for="s in schemas" :key="s" :value="s">{{ s }}</option>
               </select>
               <label class="self-center text-ink-muted">Table</label>
               <select
                 v-model="pickedTable"
-                class="h-7 w-72 rounded border border-border bg-surface-0 px-2 font-mono outline-none focus:border-accent"
+                class="h-7 w-72 rounded border border-border bg-surface-0 px-2 outline-none focus:border-accent"
               >
-                <option value="">— pick —</option>
+                <option value="">- pick -</option>
                 <option v-for="t in remoteTables" :key="`${t.schema}.${t.name}`" :value="t.name">
                   {{ t.name }} ({{ t.row_count.toLocaleString() }} rows{{ t.kind === 'view' ? ', view' : '' }})
                 </option>
