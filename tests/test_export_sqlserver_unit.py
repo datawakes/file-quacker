@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from file_quacker import export, ingest
+from file_quacker import export, ingest, naming
 
 
 @pytest.mark.parametrize('src,expected', [
@@ -21,9 +21,10 @@ from file_quacker import export, ingest
     ('HTTPResponseCode', 'http_response_code'),
     ('col.with.dots',    'col_with_dots'),
     ('USD',              'usd'),
+    ('...',              'col'),
 ])
 def test_snake_case(src, expected):
-    assert export._to_snake_case(src) == expected
+    assert naming.snake_case(src) == expected
 
 
 @pytest.mark.parametrize('src,expected', [
@@ -40,26 +41,26 @@ def test_qident_ss(src, expected):
 
 def test_unique_target_first_occurrence_kept():
     taken: set[str] = set()
-    assert export._unique_target('foo', taken) == 'foo'
+    assert naming.unique_name('foo', taken) == 'foo'
     taken.add('foo')
-    assert export._unique_target('foo', taken) == 'foo_1'
+    assert naming.unique_name('foo', taken) == 'foo_1'
 
 
 def test_unique_target_cascades_when_suffix_taken():
     """If `foo_1` is already taken, the next collision becomes `foo_2`."""
     taken = {'foo', 'foo_1'}
-    assert export._unique_target('foo', taken) == 'foo_2'
+    assert naming.unique_name('foo', taken) == 'foo_2'
 
 
 def test_unique_target_handles_existing_suffix_source():
     """A literal source named `foo_1` that comes after two `foo`s gets
     `foo_1_1` because `foo_1` was already claimed by the de-duper."""
     taken: set[str] = set()
-    t1 = export._unique_target('foo', taken)
+    t1 = naming.unique_name('foo', taken)
     taken.add(t1)
-    t2 = export._unique_target('foo', taken)
+    t2 = naming.unique_name('foo', taken)
     taken.add(t2)
-    t3 = export._unique_target('foo_1', taken)
+    t3 = naming.unique_name('foo_1', taken)
     taken.add(t3)
     assert (t1, t2, t3) == ('foo', 'foo_1', 'foo_1_1')
 

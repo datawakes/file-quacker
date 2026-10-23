@@ -11,6 +11,7 @@ renames appear in the file's header / schema.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass
 from threading import RLock
@@ -18,6 +19,7 @@ from typing import Literal
 
 from . import db
 from .export_source import ExportSource
+from .text_values import string_columns, stripped_sql
 
 
 @dataclass
@@ -54,25 +56,6 @@ class ExcelTarget:
 FileTarget = FlatTarget | ParquetTarget | ExcelTarget
 
 
-# Whitespace classes the trim option strips off the ends of VARCHAR cells.
-# Mirrors elt_preprocess_ff.auto_trim and pandas str.strip():
-#   [[:space:]] – ASCII whitespace
-#   \p{Z}       – Unicode separator characters (NBSP, narrow NBSP, etc.)
-#   \x85        – NEL (C1 control)
-#   \x1c-\x1f   – FS / GS / RS / US (ASCII info separators)
-# Zero-width characters (ZWSP, ZWJ, BOM) are kept – they aren't whitespace.
-WS_TRIM_PATTERN = r'^[[:space:]\p{Z}\x85\x1c-\x1f]+|[[:space:]\p{Z}\x85\x1c-\x1f]+$'
-
-
-def _string_columns(qtable: str) -> set[str]:
-    """Names of VARCHAR columns on a DuckDB table or view."""
-    info = db.conn().execute(f"""
-        pragma table_info({qtable})
-        ;
-    """).fetchall()
-    return {row[1] for row in info if row[2].upper() == 'VARCHAR'}
-
-
 def _project(source: str, is_string: bool, trim_strings: bool) -> str:
     """SELECT expression for one source column. String columns get wrapped
     in regexp_replace when trim is on; an empty result is then promoted
@@ -81,7 +64,7 @@ def _project(source: str, is_string: bool, trim_strings: bool) -> str:
     behaves on the source side. Non-string columns are the bare ident."""
     qident = db.quote_ident(source)
     if trim_strings and is_string:
-        return f"nullif(regexp_replace({qident}, '{WS_TRIM_PATTERN}', '', 'g'), '')"
+        return stripped_sql(qident)
     return qident
 
 
@@ -155,21 +138,41 @@ def _strip_kind(d: dict) -> dict:
     return {k: v for k, v in d.items() if k != 'kind'}
 
 
+def _naive_time_columns(qtable: str) -> dict[str, str]:
+    """Time-zone-aware columns on a table or view, mapped to the type
+    that drops the zone. The cast keeps the session's local wall time
+    (TIMETZ keeps its own), which is what the CSV export writes minus
+    the offset."""
+    naive = {'TIMESTAMP WITH TIME ZONE': 'timestamp', 'TIME WITH TIME ZONE': 'time'}
+    info = db.conn().execute(f"""
+        pragma table_info({qtable})
+        ;
+    """).fetchall()
+    return {row[1]: naive[row[2]] for row in info if row[2] in naive}
+
+
 def _select_with_mappings(qtable: str, mappings: list[Mapping],
-                          trim_strings: bool = False) -> tuple[str, list[str]]:
+                          trim_strings: bool = False,
+                          naive_times: bool = False) -> tuple[str, list[str]]:
     """Return ``(select_list, target_column_names)`` honoring the user's
     source→target renames.  Falls back to every non-meta column on the
     table when mappings is empty. When ``trim_strings`` is on, VARCHAR
     columns get wrapped in regexp_replace so leading / trailing whitespace
-    is stripped on the way out.
+    is stripped on the way out. ``naive_times`` casts time-zone-aware
+    columns to their plain types, for writers that reject zones.
     """
-    str_cols = _string_columns(qtable) if trim_strings else set()
+    str_cols = string_columns(qtable) if trim_strings else set()
+    tz_cols = _naive_time_columns(qtable) if naive_times else {}
+
+    def expr_for(source: str) -> str:
+        if source in tz_cols:
+            return f'cast({db.quote_ident(source)} as {tz_cols[source]})'
+        return _project(source, source in str_cols, trim_strings)
 
     if mappings:
         parts = []
         for m in mappings:
-            expr = _project(m.source, m.source in str_cols, trim_strings)
-            parts.append(f'{expr} as {db.quote_ident(m.target)}')
+            parts.append(f'{expr_for(m.source)} as {db.quote_ident(m.target)}')
         targets = [m.target for m in mappings]
         return ', '.join(parts), targets
 
@@ -183,8 +186,8 @@ def _select_with_mappings(qtable: str, mappings: list[Mapping],
     cols = [r[1] for r in info if r[1] != '_src_row_num']
     parts = []
     for n in cols:
-        expr = _project(n, n in str_cols, trim_strings)
-        # Trimmed string columns need an alias to keep the column name in
+        expr = expr_for(n)
+        # Trimmed or cast columns need an alias to keep the column name in
         # the output; bare-ident projections don't.
         parts.append(expr if expr == db.quote_ident(n) else f'{expr} as {db.quote_ident(n)}')
     return ', '.join(parts), cols
@@ -281,9 +284,12 @@ def _export_excel(source: ExportSource, tgt: ExcelTarget,
     t0 = time.perf_counter()
     _set(phase='writing', rows_written=0, elapsed_ms=0, error=None)
     src_name, cleanup = source.materialize()
+    ws = None
     try:
         qtable = db.quote_ident(src_name)
-        select_list, target_cols = _select_with_mappings(qtable, mappings, trim_strings)
+        # openpyxl rejects time-zone-aware datetimes.
+        select_list, target_cols = _select_with_mappings(qtable, mappings, trim_strings,
+                                                         naive_times=True)
         c = db.conn()
         cur = c.execute(f"""
             select  {select_list}
@@ -318,4 +324,10 @@ def _export_excel(source: ExportSource, tgt: ExcelTarget,
         return {'ok': False, 'error': str(ex),
                 'elapsed_ms': int((time.perf_counter() - t0) * 1000)}
     finally:
+        # An unsaved write-only sheet keeps its temp file open, and
+        # openpyxl's exit hook then fails to delete it. Best-effort, so
+        # it can't mask the error that got us here.
+        if ws is not None and not ws.closed:
+            with contextlib.suppress(Exception):
+                ws.close()
         cleanup()

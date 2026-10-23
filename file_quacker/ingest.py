@@ -6,32 +6,50 @@ source values are preserved exactly; no silent date / int coercion.
 quote escapes parse correctly.  All identifiers pass through
 `db.quote_ident` to prevent SQL injection via table / column names.
 
-For text files we try a ladder of strategies and keep the first one that
-loads cleanly.  DuckDB's built-in `encoding=` covers the big three
-(UTF-8, UTF-16, Latin-1) plus `cp1252` for Windows text, without having
-to transcode to a temp file.  `chardet` seeds the ladder with a
-best-guess encoding; the final lenient strategy flips
-`ignore_errors=True` so malformed rows land in a `reject_errors` table
-instead of aborting the load.
+Text files load with the fastest settings first (parallel, strict).
+When DuckDB rejects the file, its error message picks the next attempt:
+null padding for short rows, `ignore_errors` for rows with extra fields
+(those land in a `<name>__rejects` table), a bigger line limit, or a
+looser quote rule.  The encoding, delimiter and layout (title lines,
+header, summary rows at the bottom) come from `sniff`; the encoding only
+changes when DuckDB says the bytes don't decode.
 """
 
 from __future__ import annotations
 
+import codecs
 import csv as _csv
+import itertools
 import re
-from dataclasses import dataclass, field
+from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
-import chardet
 import duckdb
 
-from . import db, derive
+from . import db, derive, sniff
 
-CandidateDelim = Literal[',', '|', ';', '\t']
-CANDIDATE_DELIMS: tuple[CandidateDelim, ...] = (',', '|', ';', '\t')
+# Tried in this order after the first guess, only on a decoding error.
+# iso-8859-1 reads every byte (DuckDB's built-in latin-1 rejects 0x80-0x9F).
+FALLBACK_ENCODINGS: tuple[str, ...] = ('utf-8', 'cp1252', 'iso-8859-1')
 
-NO_QUOTE_SENTINEL = '«'
+# read_csv's buffer.  DuckDB's default (16 x max_line_size = 32 MB) cuts a
+# file into many parallel batches, and the table they build makes later
+# scans 10-40% slower (suggest_casts / auto_derive), even though its
+# storage layout reads the same.  From 64 MB on, downstream speed matches
+# the old 32 MB-line-size loads.  An explicit buffer also lifts DuckDB's
+# 2 MB line limit, so long narrative cells need no extra rung.
+READ_BUFFER_BYTES = 64 * 1024 * 1024
+
+# Up to about this many rows, number them inside the load with
+# row_number(): with a buffer that holds the whole file, DuckDB then
+# parses it on all threads, which matters for wide rows (RTN: 1.6 s vs
+# 2.3 s).  Past it the window costs more than it saves (big_comma: 2.2 s
+# vs 1.0 s), so the number comes from rowid afterwards.
+INLINE_NUMBER_MAX_ROWS = 250_000
+INLINE_READ_BUFFER_BYTES = 256 * 1024 * 1024
 
 SQL_SAFE_NAME = re.compile(r'[^0-9A-Za-z_]+')
 
@@ -47,25 +65,30 @@ class IngestOptions:
     quote: str = '"'
     escape: str | None = None
     encoding: str | None = None
-    first_row: int = 1
+    # 1-based line of the header, 0 = no header row.  None detects it.
+    first_row: int | None = None
     skip_rows: int = 0
+    # Summary rows to drop from the bottom.  None detects them.
+    skip_footer: int | None = None
     ignore_errors: bool = False
-    # parallel=False is required when null_padding meets quoted newlines.
+    # Starting values for the first attempt; the ladder turns parallel off
+    # when null padding meets quoted newlines, and strict mode off as a
+    # last resort.
     parallel: bool = True
-    # strict_mode=False relaxes RFC-4180 quoting; the catch-all rung uses it.
     strict_mode: bool = True
-    # -1 scans the whole file for inference; None uses DuckDB's 20480 default.
-    # Lifts column-count detection past late wide rows.
+    # Rows DuckDB samples for dialect detection; None keeps its default.
     sample_size: int | None = None
     # Views lazy-read the source on every query and tank interactive perf;
     # always materialize.
     materialize: bool = True
     sheet: str | None = None
     preferred_table_name: str | None = None
+    # Nulled only in columns where every other value looks like a number
+    # or a date, so a country code 'NA' next to 'US' survives.
     # Case-sensitive (DuckDB binary collation), so the surname `Null`,
-    # lowercase `na`, country code `Na` etc. survive.  Empty string is
-    # intentionally absent: DuckDB already nulls unquoted empty fields
-    # in CSV, and a blanket `'' -> NULL` rule loses too much in parquet/xlsx.
+    # lowercase `na` etc. survive.  Empty string is intentionally absent:
+    # DuckDB already nulls unquoted empty fields in CSV, and a blanket
+    # `'' -> NULL` rule loses too much in parquet/xlsx.
     nullify_tokens: list[str] = field(
         default_factory=lambda: ['NA', 'NaN']
     )
@@ -94,28 +117,38 @@ class IngestResult:
     delimiter: str | None = None
     encoding: str | None = None
     first_row: int | None = None
+    footer_rows: int | None = None
     # Name of the strategy that succeeded (for file-format debugging).
     strategy: str | None = None
+    # Plain-English notes on what detection found, set only when worth
+    # telling the user (bad bytes, a fallback encoding, a byte order mark,
+    # title lines or summary rows).
+    encoding_note: str | None = None
+    layout_note: str | None = None
 
 
 # --------------------------------------------------------------------------- #
 # Public entry points                                                         #
 # --------------------------------------------------------------------------- #
 
-def preview_file_lines(path: str, n: int = 30, encoding: str | None = None) -> dict:
-    """First ``n`` raw lines of a text file plus the encoding used.
-    Feeds the Open-with-options dialog.  Decode failures fall back to
-    UTF-8 + replace so the user always sees something (even mojibake)
-    and can pick a different encoding from the dropdown.
+def preview_file_lines(path: str, n: int = 30, encoding: str | None = None,
+                       delimiter: str | None = None) -> dict:
+    """First ``n`` raw lines of a text file plus what detection found:
+    the encoding used for the preview, the delimiter, and the header row
+    and footer rows a plain load would use (with ``delimiter`` when the
+    user picked one).  Feeds the Open-with-options dialog.  Decode
+    failures fall back to UTF-8 + replace so the user always sees
+    something (even mojibake) and can pick a different encoding from the
+    dropdown.
     """
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(path)
-    if not encoding:
-        encoding = _chardet_to_duckdb(_detect_encoding(p)) or 'utf-8'
-    used = encoding
+    found = _sniff_csv(p, IngestOptions(encoding=_duckdb_encoding(encoding) if encoding else None,
+                                        delimiter=delimiter or None))
+    used = found.encodings[0]
     try:
-        with p.open('r', encoding=encoding, errors='replace', newline='') as f:
+        with p.open('r', encoding=_python_codec(used, p), errors='replace', newline='') as f:
             lines = []
             for i, line in enumerate(f):
                 if i >= n:
@@ -126,11 +159,19 @@ def preview_file_lines(path: str, n: int = 30, encoding: str | None = None) -> d
             raw = f.read()
         lines = raw.decode('utf-8', errors='replace').splitlines()[:n]
         used = 'utf-8 (forced)'
-    return {'lines': lines, 'encoding': used, 'sniffed_delimiter': _sniff_delimiter_bytes(p)}
+    return {
+        'lines': lines,
+        'encoding': used,
+        'encoding_note': found.encoding_note(found.encodings[0]),
+        'sniffed_delimiter': found.delimiter,
+        'detected_first_row': found.first_row,
+        'detected_footer_rows': found.footer_rows,
+        'layout_note': found.layout_why,
+    }
 
 
 def load_file(path: str, opts: IngestOptions | None = None) -> IngestResult:
-    opts = opts or IngestOptions()
+    opts = _clean_numbers(opts or IngestOptions())
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(path)
@@ -149,181 +190,336 @@ def load_file(path: str, opts: IngestOptions | None = None) -> IngestResult:
     return _load_csv(p, opts)
 
 
+def _clean_numbers(opts: IngestOptions) -> IngestOptions:
+    """A cleared number field reaches us as '' (or junk): header row and
+    footer go back to auto-detect, skipped lines to 0."""
+    def number(v):
+        try:
+            return int(v) if v is not None and v != '' else None
+        except (TypeError, ValueError):
+            return None
+    return replace(opts, first_row=number(opts.first_row), skip_footer=number(opts.skip_footer),
+                   skip_rows=number(opts.skip_rows) or 0)
+
+
 # --------------------------------------------------------------------------- #
 # CSV / delimited text                                                        #
 # --------------------------------------------------------------------------- #
 
-def _load_csv(path: Path, opts: IngestOptions) -> IngestResult:
-    """Load a delimited-text file by trying a ladder of parsing
-    strategies.  The first one that produces a usable table wins; each
-    failed attempt drops its partial artifact.  If the user passed an
-    explicit encoding / delimiter we honor that and skip the ladder.
-    """
-    # Delimiter sniff is encoding-agnostic; we count bytes of the four
-    # candidate separators, all of which are ASCII, so we don't have to
-    # successfully decode the file first.
-    delim = opts.delimiter or _sniff_delimiter_bytes(path)
+@dataclass
+class _CsvSniff:
+    """What `sniff` found about a text file, with the user's choices on top."""
+    guess: sniff.EncodingGuess | None   # None when the user set the encoding
+    encodings: list[str]                # to try, in order
+    # UTF-8 with a few bad bytes: the rows holding them go to the rejects
+    bad_rows_expected: bool
+    # One of those bad bytes sits in the header line, so FQ names the columns
+    header_not_utf8: bool
+    delimiter: str
+    other_delims: list[sniff.DelimiterScore]   # ranked, best first
+    field_count: int | None             # most common width for `delimiter`, when scored
+    first_row: int
+    footer_rows: int
+    footer_detected: bool               # False when the user set it
+    layout_why: str | None              # None when the user set both
+    # layout_why when the detected values differ from "header on line 1,
+    # no footer" and were used
+    layout_note: str | None
 
-    # User-forced encoding bypasses the ladder.
-    if opts.encoding:
-        return _try_load_csv(path, opts, delim, encoding=opts.encoding,
-                             ignore_errors=opts.ignore_errors,
-                             strategy='user-set')
+    def encoding_note(self, used: str) -> str | None:
+        """The encoding guess's reason, when it's worth telling the user."""
+        g = self.guess
+        if g is None:
+            return None
+        if self.header_not_utf8:
+            return (f"{g.why.split(';')[0]}; one is in the header line, so the column "
+                    'names are read as Windows-1252 and the rows holding the others are rejected')
+        if used != g.encoding:
+            return f'{g.why}; DuckDB could not decode it that way, so it is read as {used}'
+        if g.encoding == 'utf-8' and g.clean and not g.bom:
+            return None
+        return g.why
 
-    guessed = _detect_encoding(path)
-    guessed_duck = _chardet_to_duckdb(guessed)
-    # Encoding for the lenient/fallback rungs.  If chardet landed on
-    # something other than utf-8/ascii, trust it and carry it forward;
-    # otherwise cp1252 is the safe every-byte-decodable guess.  This
-    # avoids silently re-reading a utf-16 or latin-1 file as cp1252 when
-    # the original encoding rung failed for a non-encoding reason.
-    lenient_enc = guessed_duck if (guessed_duck and guessed_duck != 'utf-8') else 'cp1252'
 
-    # (label, encoding, ignore_errors, no_quote, parallel, strict_mode, sample_size, auto_delim)
-    strategies: list[tuple[str, str, bool, bool, bool, bool, int | None, bool]] = []
-    strategies.append(('utf-8', 'utf-8', False, False, True, True, None, False))
-    # Rescues clean files when byte-count sniff picks the wrong delim
-    # (e.g. a pipe file with commas in quoted narratives).
-    strategies.append(('utf-8 + auto-delim', 'utf-8', False, False, True, True, None, True))
-    if guessed_duck and guessed_duck != 'utf-8':
-        strategies.append((f'{guessed_duck} (chardet)', guessed_duck, False, False, True, True, None, False))
-    # Try UTF-8 again with sequential + full-sample BEFORE switching to
-    # lenient_enc; otherwise a real UTF-8 file with quoted newlines or
-    # a late wide row gets silently re-decoded as cp1252.
-    strategies.append(('utf-8 + sequential + full-sample',
-                       'utf-8', False, False, False, True, -1, False))
-    if lenient_enc != 'utf-8':
-        strategies.append((f'{lenient_enc} + sequential + full-sample',
-                           lenient_enc, False, False, False, True, -1, False))
-    strategies.append((f'{lenient_enc} + sequential + ignore_errors + full-sample',
-                       lenient_enc, True, False, False, True, -1, False))
-    strategies.append((f'{lenient_enc} + sequential + ignore_errors + auto-delim + full-sample',
-                       lenient_enc, True, False, False, True, -1, True))
-    # Last resort: drop the quote char and loosen RFC-4180 strictness.
-    strategies.append((f'{lenient_enc} + sequential + ignore_errors + no-quote + strict=false',
-                       lenient_enc, True, True, False, False, -1, False))
+def _sniff_csv(path: Path, opts: IngestOptions) -> _CsvSniff:
+    """Encoding, delimiter and layout for `path`; values the user set win."""
+    guess = None if opts.encoding else sniff.detect_encoding(path)
+    encoding = opts.encoding or guess.encoding
+    scores = [] if opts.delimiter else sniff.score_delimiters(path, encoding, opts.quote)
+    delimiter = opts.delimiter or (scores[0].delimiter if scores else ',')
+    layout = None
+    if opts.first_row is None or opts.skip_footer is None:
+        layout = sniff.detect_layout(path, encoding, delimiter, opts.quote)
+    first_row = layout.first_row if opts.first_row is None else opts.first_row
+    footer_rows = layout.footer_rows if opts.skip_footer is None else opts.skip_footer
+    layout_note = None
+    if layout and ((opts.first_row is None and first_row != 1)
+                   or (opts.skip_footer is None and footer_rows > 0)):
+        layout_note = layout.why
 
-    errors: list[str] = []
-    for label, enc, lenient, no_quote, parallel, strict, sample_size, auto_delim in strategies:
-        try:
-            effective = _with_flags(opts, no_quote=no_quote, parallel=parallel,
-                                    strict=strict, sample_size=sample_size)
-            effective_delim = None if auto_delim else delim
-            return _try_load_csv(path, effective, effective_delim,
-                                 encoding=enc,
-                                 ignore_errors=lenient,
-                                 strategy=label)
-        except _RETRY_ERRORS as ex:
-            # Keep all of DuckDB's error lines joined with `|`; the first
-            # line is the type, the rest name the column / value / context.
-            detail = ' | '.join(line.strip() for line in str(ex).splitlines() if line.strip())
-            errors.append(f'[{label}] {detail}')
-            continue
-
-    raise IngestError(
-        'Could not read this file after trying '
-        f'{len(strategies)} strategies:\n  ' + '\n  '.join(errors)
+    tolerant = guess is not None and not guess.clean
+    # DuckDB silently drops a header line it can't decode and promotes the
+    # first data row, so then FQ reads the names itself.
+    header_not_utf8 = tolerant and first_row > 0 and _line_not_utf8(path, opts.skip_rows + first_row)
+    if guess is None:
+        encodings = [opts.encoding]
+    else:
+        encodings = list(dict.fromkeys((guess.encoding, *FALLBACK_ENCODINGS)))
+    return _CsvSniff(
+        guess=guess,
+        encodings=encodings,
+        bad_rows_expected=tolerant,
+        header_not_utf8=header_not_utf8,
+        delimiter=delimiter,
+        other_delims=[s for s in scores if s.delimiter != delimiter],
+        field_count=next((s.field_count for s in scores if s.delimiter == delimiter), None),
+        first_row=first_row,
+        footer_rows=footer_rows,
+        footer_detected=opts.skip_footer is None,
+        layout_why=layout.why if layout else None,
+        layout_note=layout_note,
     )
 
 
-def _with_flags(
-    opts: IngestOptions,
-    *,
-    no_quote: bool,
-    parallel: bool,
-    strict: bool,
-    sample_size: int | None,
-) -> IngestOptions:
-    from dataclasses import replace
-    kwargs: dict = {'parallel': parallel, 'strict_mode': strict, 'sample_size': sample_size}
-    if no_quote:
-        kwargs['quote'] = NO_QUOTE_SENTINEL
-        kwargs['escape'] = None
-    return replace(opts, **kwargs)
+def _duckdb_encoding(name: str) -> str:
+    """DuckDB's utf-16 is little-endian; it rejects the -le spellings."""
+    key = name.strip().lower().replace('_', '-')
+    return 'utf-16' if key in ('utf-16le', 'utf-16-le') else name
 
 
-def _try_load_csv(path: Path, opts: IngestOptions, delim: str | None, *,
-                  encoding: str, ignore_errors: bool,
-                  strategy: str) -> IngestResult:
-    """Execute one load attempt.  Any DuckDB error bubbles up; the
-    caller (ladder loop) decides whether to retry.  Pass ``delim=None``
-    to let DuckDB sniff the delimiter itself."""
-    quote = '' if opts.quote == NO_QUOTE_SENTINEL else opts.quote
-    escape = quote if opts.escape is None else opts.escape
+def _python_codec(encoding: str, path: Path) -> str:
+    """Python codec that reads `path` the way DuckDB's `encoding` does."""
+    if encoding == 'utf-8':
+        return 'utf-8-sig'   # drops a byte order mark, reads plain UTF-8 the same
+    if encoding == 'utf-16':
+        with path.open('rb') as f:
+            bom = f.read(2) in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
+        return 'utf-16' if bom else 'utf-16-le'
+    return encoding
 
-    header = opts.first_row >= 1
-    skip = opts.skip_rows + (opts.first_row - 1 if opts.first_row > 1 else 0)
 
-    name = opts.preferred_table_name or _derive_table_name(path)
-    name = _unique_name(name)
-    qname = db.quote_ident(name)
+def _line_not_utf8(path: Path, line_no: int) -> bool:
+    """True when physical line `line_no` (1-based) isn't valid UTF-8.
+    Layout counts quote-aware records, which only differ from lines when
+    a title line holds a quoted line break."""
+    try:
+        _physical_line(path, line_no).decode('utf-8')
+    except UnicodeDecodeError:
+        return True
+    return False
 
-    object_kw = 'table' if opts.materialize else 'view'
 
-    params: dict = {
-        'header': header,
-        'quote': quote,
-        'escape': escape,
-        'ignore_errors': ignore_errors,
-        'all_varchar': True,
-        'null_padding': True,
-        'skip': skip,
-        'encoding': encoding,
-        'parallel': opts.parallel,
-        'strict_mode': opts.strict_mode,
-        # Default is 2 MB; insufficient for exports that pack long
-        # narratives into a single cell.  32 MB covers pathological
-        # rows without blowing up memory on sane files.
-        'max_line_size': 32 * 1024 * 1024,
-    }
-    if opts.sample_size is not None:
-        params['sample_size'] = opts.sample_size
-    if delim is not None:
-        params['delim'] = delim
-    if opts.nullify_tokens:
-        # Passing nullstr= replaces DuckDB's default (empty string for
-        # unquoted empty fields), so prepend '' to keep that behavior
-        # while adding our extra tokens.
-        params['nullstr'] = ['', *opts.nullify_tokens]
-    if ignore_errors:
-        params['store_rejects'] = True
+def _physical_line(path: Path, line_no: int) -> bytes:
+    with path.open('rb') as f:
+        for _ in range(line_no - 1):
+            f.readline()
+        return f.readline()
 
-    sql = f"""
-        create or replace {object_kw} {qname} as
-        select  row_number() over ()  as {db.quote_ident(ROW_NUM_COLUMN)}
-        ,       *
-        from    read_csv(
-                    {_sql_path_literal(str(path))}
-                  , {_fmt_params(params)}
-                )
-        ;
+
+def _header_names(path: Path, opts: IngestOptions, encoding: str, delim: str) -> list[str]:
+    """Column names from the header line, named the way DuckDB names
+    them.  Bytes that don't decode read as Windows-1252."""
+    line_no = opts.skip_rows + opts.first_row
+    codec = _python_codec(encoding, path)
+    if codec.startswith('utf-16'):
+        with path.open('r', encoding=codec, errors='replace', newline='') as f:
+            for _ in range(line_no - 1):
+                f.readline()
+            text = f.readline()
+    else:
+        raw = _physical_line(path, line_no)
+        try:
+            text = raw.decode(codec)
+        except UnicodeDecodeError:
+            text = raw.decode('cp1252', errors='replace')
+    return _duckdb_names(_parse_record(text.rstrip('\r\n'), delim, opts.quote))
+
+
+def _parse_record(text: str, delim: str, quote: str) -> list[str]:
+    if quote:
+        rdr = _csv.reader([text], delimiter=delim, quotechar=quote, doublequote=True)
+    else:
+        rdr = _csv.reader([text], delimiter=delim, quoting=_csv.QUOTE_NONE)
+    return next(rdr, [])
+
+
+def _duckdb_names(fields: list[str]) -> list[str]:
+    """Trimmed, blanks as columnN (0-based), repeats suffixed _1, _2 ...
+    compared without case: what DuckDB does with a header row."""
+    names: list[str] = []
+    seen: set[str] = set()
+    counts: dict[str, int] = {}
+    for i, field_ in enumerate(fields):
+        base = field_.strip() or f'column{i}'
+        name, k = base, counts.get(base.lower(), 0)
+        while name.lower() in seen:
+            k += 1
+            name = f'{base}_{k}'
+        counts[base.lower()] = k
+        seen.add(name.lower())
+        names.append(name)
+    return names
+
+
+def _width(path: Path, opts: IngestOptions, encoding: str, delim: str) -> int:
+    """Most common field count in the head of a headerless file."""
+    with path.open('r', encoding=_python_codec(encoding, path), errors='replace', newline='') as f:
+        head = f.read(1 << 20)
+    if opts.quote:
+        rdr = _csv.reader(head.splitlines(), delimiter=delim, quotechar=opts.quote, doublequote=True)
+    else:
+        rdr = _csv.reader(head.splitlines(), delimiter=delim, quoting=_csv.QUOTE_NONE)
+    counts = Counter(len(r) for r in itertools.islice(rdr, 1000) if r)
+    return counts.most_common(1)[0][0] if counts else 1
+
+
+@dataclass(frozen=True)
+class _CsvAttempt:
+    """One set of read_csv settings tried by the ladder."""
+    encoding: str
+    delim: str | None               # None lets DuckDB sniff it
+    parallel: bool = True
+    strict_mode: bool = True
+    # FQ names the columns and DuckDB skips the header line as data
+    own_header: bool = False
+    # FQ gives DuckDB the whole dialect (auto_detect=false), for when its
+    # sniffer gives up on rows that the reader itself can reject one by one
+    no_sniff: bool = False
+    null_padding: bool = False
+    no_quote: bool = False
+    ignore_errors: bool = False
+    # Number rows with row_number() in the load (see INLINE_NUMBER_MAX_ROWS)
+    number_inline: bool = False
+
+    def label(self, user_encoding: bool, sniffed_delim: str) -> str:
+        parts = [f'{self.encoding} (user-set)' if user_encoding else self.encoding]
+        if self.delim is None:
+            parts.append('auto-delim')
+        elif self.delim != sniffed_delim:
+            parts.append(f'delimiter {self.delim!r}')
+        if self.own_header:
+            parts.append('own header')
+        if self.no_sniff:
+            parts.append('no-sniff')
+        if self.null_padding:
+            parts.append('null_padding')
+        if not self.parallel:
+            parts.append('sequential')
+        if self.no_quote:
+            parts.append('no-quote')
+        if not self.strict_mode:
+            parts.append('strict=false')
+        if self.ignore_errors:
+            parts.append('ignore_errors')
+        return ' + '.join(parts)
+
+
+def _load_csv(path: Path, opts: IngestOptions) -> IngestResult:
+    """Load a delimited-text file.  Starts with the fastest settings and,
+    after each failure, changes only what DuckDB's error points at.  A
+    user-set encoding, delimiter, header row or footer count is never
+    changed.
     """
+    if opts.encoding:
+        opts = replace(opts, encoding=_duckdb_encoding(opts.encoding))
+    found = _sniff_csv(path, opts)
+    if found.guess is not None and found.guess.big_endian_utf16:
+        raise IngestError(f'Could not read this file: {found.guess.why}.')
+    opts = replace(opts, first_row=found.first_row, skip_footer=found.footer_rows)
+    delim = found.delimiter
+    user_encoding = bool(opts.encoding)
+    may_probe_delim = opts.delimiter is None
+    name = _unique_name(opts.preferred_table_name or _derive_table_name(path))
+    # Reject tables are temp tables, so every attempt shares one cursor.
     c = db.conn()
-    c.execute(sql)
 
+    def label(a: _CsvAttempt) -> str:
+        return a.label(user_encoding, delim)
+
+    def names_for(a: _CsvAttempt) -> list[str] | None:
+        if a.delim is None:
+            return None
+        if a.own_header or (a.no_sniff and opts.first_row > 0):
+            return _header_names(path, opts, a.encoding, a.delim)
+        if a.no_sniff:
+            width = found.field_count if a.delim == found.delimiter and found.field_count else None
+            return [f'column{i}' for i in range(width or _width(path, opts, a.encoding, a.delim))]
+        return None
+
+    attempt: _CsvAttempt | None = _CsvAttempt(
+        encoding=found.encodings[0],
+        delim=delim,
+        parallel=opts.parallel,
+        strict_mode=opts.strict_mode,
+        own_header=found.header_not_utf8,
+        ignore_errors=opts.ignore_errors or found.bad_rows_expected,
+        number_inline=opts.materialize and _fits_inline(path),
+    )
+    errors: list[str] = []
+    while attempt is not None:
+        try:
+            reject_types = _run_csv_attempt(c, name, path, opts, attempt, names_for(attempt))
+        except duckdb.Error as ex:
+            kind = _classify_csv_error(str(ex))
+            if kind == 'unsupported_encoding':
+                _drop_failed_load(c, name, opts.materialize)
+                raise IngestError(f'DuckDB cannot read the encoding {attempt.encoding!r}. '
+                                  'Pick another one, or leave the encoding on Auto.') from None
+            errors.append(f'[{label(attempt)}] {_error_detail(ex)}')
+            if attempt.delim is None:
+                may_probe_delim = False
+            attempt = _next_attempt(attempt, kind, found.encodings, delim, may_probe_delim)
+            continue
+        if attempt.delim is None and _data_col_count(c, name) == 1:
+            # DuckDB's sniffer falls back to one column when it finds no
+            # dialect; that's no answer for a file that failed to parse.
+            errors.append(f'[{label(attempt)}] DuckDB found a single column')
+            may_probe_delim = False
+            attempt = _next_attempt(attempt, 'other', found.encodings, delim, may_probe_delim)
+            continue
+        retry = _retry_for_rejects(attempt, reject_types, found.encodings,
+                                   found.bad_rows_expected)
+        if retry is None:
+            break
+        errors.append(f'[{label(attempt)}] rejected rows: ' + ', '.join(sorted(reject_types)))
+        attempt = retry
+    else:
+        _drop_failed_load(c, name, opts.materialize)
+        raise IngestError(
+            'Could not read this file after trying '
+            f'{len(errors)} strategies:\n  ' + '\n  '.join(errors)
+        )
+
+    if attempt.ignore_errors and 'UNQUOTED VALUE' in reject_types and not attempt.no_quote:
+        attempt = _keep_more_rows(c, name, path, opts, attempt, names_for)
+    if may_probe_delim and attempt.delim == delim and _data_col_count(c, name) == 1:
+        attempt = _probe_other_delims(c, name, path, opts, attempt, found.other_delims, names_for)
+
+    strategy = label(attempt)
+    has_rejects = False
+    if attempt.ignore_errors:
+        rejected, spanned = _save_rejects(c, name)
+        has_rejects = rejected > 0
+        strategy += f" ({rejected:,} row{'' if rejected == 1 else 's'} rejected"
+        # A broken quote can swallow several source lines into one record.
+        strategy += f', spanning {spanned:,} lines)' if spanned > rejected else ')'
+    # The footer was detected with quotes honored; once the ladder reads
+    # quotes loosely the rows no longer line up with that count.
+    keep_footer = found.footer_detected and (attempt.no_quote or not attempt.strict_mode)
+    footer_rows = 0
+    if opts.materialize and not keep_footer:
+        footer_rows = _drop_footer(name, opts.skip_footer)
+    if opts.materialize and not attempt.number_inline:
+        _number_rows(name)
     if opts.first_row == 0:
         _rename_default_columns(name)
+    if opts.materialize and opts.nullify_tokens:
+        _nullify_placeholder_tokens(name, opts.nullify_tokens)
 
     row_count, col_count, cols = _describe(name)
-
-    has_rejects = False
-    if ignore_errors:
-        rejects_name = _unique_name(f'{name}__rejects')
-        try:
-            c.execute(f"""
-                create or replace table {db.quote_ident(rejects_name)} as
-                select  *
-                from    reject_errors
-                ;
-            """)
-            c.execute("""
-                drop table if exists reject_errors
-                ;
-            """)
-            has_rejects = True
-        except duckdb_error_types():
-            has_rejects = False
-
+    layout_note = found.layout_note
+    if keep_footer and opts.skip_footer and layout_note:
+        layout_note += '; those rows are kept, since the quotes had to be read loosely'
     return IngestResult(
         name=name,
         source_path=str(path),
@@ -333,26 +529,398 @@ def _try_load_csv(path: Path, opts: IngestOptions, delim: str | None, *,
         col_count=col_count,
         has_rejects=has_rejects,
         columns=cols,
-        delimiter=delim,
-        encoding=encoding,
+        delimiter=attempt.delim,
+        encoding=attempt.encoding,
         first_row=opts.first_row,
+        footer_rows=footer_rows,
         strategy=strategy,
+        encoding_note=found.encoding_note(attempt.encoding),
+        layout_note=layout_note,
     )
 
 
-class IngestError(Exception):
-    """Raised when every strategy in the ladder fails."""
+def _run_csv_attempt(c: duckdb.DuckDBPyConnection, name: str, path: Path,
+                     opts: IngestOptions, attempt: _CsvAttempt,
+                     names: list[str] | None) -> set[str]:
+    """Load `path` into `name` with one set of settings.  Returns the
+    error types of rejected rows (empty without ignore_errors).  DuckDB
+    errors bubble up to the ladder."""
+    params = _read_csv_params(opts, attempt, names)
+    qname = db.quote_ident(name)
+    object_kw = 'table' if opts.materialize else 'view'
+    if attempt.ignore_errors:
+        _drop_reject_tables(c)
+    c.execute(f"""
+        create or replace {object_kw} {qname} as
+        select  {_row_num_placeholder(opts.materialize and not attempt.number_inline)}  as {db.quote_ident(ROW_NUM_COLUMN)}
+        ,       *
+        from    read_csv(
+                    {_sql_path_literal(str(path))}
+                  , {_fmt_params(params)}
+                )
+        ;
+    """)
+    if not opts.materialize:
+        # A view parses lazily; read it once so parse errors surface here.
+        c.execute(f"""
+            select  count(*)
+            from    {qname}
+            ;
+        """).fetchone()
+    if not attempt.ignore_errors:
+        return set()
+    rows = c.execute("""
+        select  distinct cast(error_type as varchar)
+        from    temp.reject_errors
+        ;
+    """).fetchall()
+    return {r[0] for r in rows}
 
 
-# Error classes we retry on: anything DuckDB raises for "file not
-# parseable as configured"; invalid encoding, column-count mismatch,
-# conversion errors.  Programmer errors (SyntaxError, AttributeError)
-# never get caught.
-_RETRY_ERRORS: tuple[type, ...] = (
-    duckdb.InvalidInputException,
-    duckdb.ConversionException,
-    duckdb.Error,
+def _read_csv_params(opts: IngestOptions, attempt: _CsvAttempt,
+                     names: list[str] | None = None) -> dict:
+    """read_csv arguments for one attempt.  `names` are the column names
+    FQ supplies for an own-header or no-sniff attempt."""
+    quote = '' if attempt.no_quote else opts.quote
+    escape = quote if attempt.no_quote or opts.escape is None else opts.escape
+    params: dict = {
+        'header': opts.first_row >= 1 and not attempt.own_header,
+        'quote': quote,
+        'escape': escape,
+        # DuckDB would otherwise guess '#' as a comment character and drop
+        # rows such as '#N/A,...' without a word.
+        'comment': '',
+        'all_varchar': True,
+        'skip': _skip(opts) + (1 if attempt.own_header else 0),
+        'encoding': attempt.encoding,
+        'parallel': attempt.parallel,
+        'strict_mode': attempt.strict_mode,
+        'buffer_size': INLINE_READ_BUFFER_BYTES if attempt.number_inline else READ_BUFFER_BYTES,
+    }
+    if attempt.delim is not None:
+        params['delim'] = attempt.delim
+    if attempt.no_sniff:
+        params['auto_detect'] = False
+        params['columns'] = {n: 'VARCHAR' for n in names or []}
+    elif attempt.own_header:
+        params['names'] = names or []
+    if attempt.null_padding:
+        params['null_padding'] = True
+    if attempt.ignore_errors:
+        params['ignore_errors'] = True
+        params['store_rejects'] = True
+    if opts.sample_size is not None:
+        params['sample_size'] = opts.sample_size
+    return params
+
+
+def _skip(opts: IngestOptions) -> int:
+    return opts.skip_rows + max(opts.first_row - 1, 0)
+
+
+def _next_attempt(attempt: _CsvAttempt, kind: str, encodings: list[str],
+                  delim: str, may_probe_delim: bool) -> _CsvAttempt | None:
+    """Settings to try after `attempt` failed with an error of `kind`
+    (see `_classify_csv_error`).  None when nothing is left to try."""
+    # A failed delimiter probe goes back to the sniffed delimiter.
+    attempt = replace(attempt, delim=delim)
+    next_encoding = _next_encoding(attempt.encoding, encodings)
+    if kind == 'encoding' and next_encoding:
+        return replace(attempt, encoding=next_encoding)
+    if kind == 'encoding' and not attempt.ignore_errors:
+        # No encoding left to try (or the user set it): keep what decodes
+        # and put the rest in the rejects table.
+        return replace(attempt, ignore_errors=True)
+    if kind == 'sniff' and not attempt.no_sniff:
+        # The sniffer gives up on a sample holding a broken quote, short
+        # rows or title lines; read with FQ's own dialect so the reader
+        # reports (or rejects) the actual rows.
+        return replace(attempt, no_sniff=True)
+    if kind == 'too_few' and not attempt.null_padding:
+        return replace(attempt, null_padding=True)
+    if kind == 'null_padding_quoted_newlines' and attempt.parallel:
+        return replace(attempt, parallel=False)
+    if kind == 'too_many' and not attempt.ignore_errors:
+        return replace(attempt, ignore_errors=True)
+    # Unclassified, or the matching fix is already on: loosen one more
+    # step.  Broken quoting first loses the bad rows to the rejects, then
+    # relaxes strict mode, and only then reads quotes as data.
+    if may_probe_delim and kind != 'quote':
+        # DuckDB can only pick a delimiter while sniffing
+        return replace(attempt, delim=None, no_sniff=False)
+    if not attempt.null_padding and kind != 'quote':
+        return replace(attempt, null_padding=True)
+    if not attempt.ignore_errors:
+        return replace(attempt, ignore_errors=True)
+    if attempt.strict_mode and not attempt.no_quote:
+        return replace(attempt, strict_mode=False)
+    if not attempt.no_quote:
+        return replace(attempt, no_quote=True, strict_mode=False)
+    return None
+def _retry_for_rejects(attempt: _CsvAttempt, reject_types: set[str],
+                       encodings: list[str], bad_rows_expected: bool) -> _CsvAttempt | None:
+    """ignore_errors also drops rows a better setting would keep; retry
+    with that setting when the rejects show one.  Rows with bad bytes are
+    the expected rejects when the file is UTF-8 with a few of them."""
+    next_encoding = _next_encoding(attempt.encoding, encodings)
+    expected = bad_rows_expected and attempt.encoding == 'utf-8'
+    if 'INVALID ENCODING' in reject_types and next_encoding and not expected:
+        return replace(attempt, encoding=next_encoding)
+    if 'MISSING COLUMNS' in reject_types and not attempt.null_padding:
+        return replace(attempt, null_padding=True)
+    return None
+
+
+def _next_encoding(current: str, encodings: list[str]) -> str | None:
+    i = encodings.index(current)
+    return encodings[i + 1] if i + 1 < len(encodings) else None
+
+
+def _keep_more_rows(c: duckdb.DuckDBPyConnection, name: str, path: Path,
+                    opts: IngestOptions, attempt: _CsvAttempt,
+                    names_for: Callable[[_CsvAttempt], list[str] | None]) -> _CsvAttempt:
+    """A quote that never closes swallows every line up to the next quote
+    into one rejected row; reading quotes as data then keeps more.  The
+    quoted load (bad rows in the rejects) still wins unless it lost a
+    real share of the file, and never when the file quotes its values
+    (they would keep their quote characters).  Strict mode stays on so
+    split rows are rejected instead of cut short."""
+    qname = db.quote_ident(name)
+
+    def rows() -> int:
+        return c.execute(f"""
+            select  count(*)
+            from    {qname}
+            ;
+        """).fetchone()[0]
+
+    kept = rows()
+    loose = replace(attempt, no_quote=True)
+    try:
+        _run_csv_attempt(c, name, path, opts, loose, names_for(loose))
+        loose_rows = rows()
+        if loose_rows - kept > max(5, loose_rows // 100) and not _mostly_quoted(c, qname, opts.quote):
+            return loose
+    except duckdb.Error:
+        pass  # the quoted load already worked; fall back to it
+    _run_csv_attempt(c, name, path, opts, attempt, names_for(attempt))
+    return attempt
+
+
+def _mostly_quoted(c: duckdb.DuckDBPyConnection, qname: str, quote: str) -> bool:
+    """True when most values in the first 1000 rows of a no-quote load
+    start and end with the quote character."""
+    wrapped = _sql_str_literal(f'{quote}%{quote}')
+    row = c.execute(f"""
+        select  count_if(columns(* exclude ({db.quote_ident(ROW_NUM_COLUMN)})) like {wrapped})
+        ,       count(columns(* exclude ({db.quote_ident(ROW_NUM_COLUMN)})))
+        from    (select * from {qname} limit 1000)
+        ;
+    """).fetchone()
+    n = len(row) // 2
+    return sum(row[:n]) * 2 > sum(row[n:])
+
+
+def _probe_other_delims(c: duckdb.DuckDBPyConnection, name: str, path: Path,
+                        opts: IngestOptions, attempt: _CsvAttempt,
+                        others: list[sniff.DelimiterScore],
+                        names_for: Callable[[_CsvAttempt], list[str] | None]) -> _CsvAttempt:
+    """A one-column load while other delimiters split the file usually
+    means the top-ranked one was wrong: try the runner-up when it covers
+    the file well, then let DuckDB pick.  Puts the original load back
+    when neither does better."""
+    probes = [s.delimiter for s in others[:1] if s.coverage >= 0.9 and s.field_count > 1]
+    if others:
+        probes.append(None)
+    for d in probes:
+        probe = replace(attempt, delim=d)
+        if d is None and probe.no_sniff:
+            probe = replace(probe, no_sniff=False)   # DuckDB can't pick a delimiter unsniffed
+        try:
+            _run_csv_attempt(c, name, path, opts, probe, names_for(probe))
+            if _data_col_count(c, name) > 1:
+                return probe
+        except duckdb.Error:
+            pass  # the original load already worked; fall back to it
+    if probes:
+        _run_csv_attempt(c, name, path, opts, attempt, names_for(attempt))
+    return attempt
+
+
+def _data_col_count(c: duckdb.DuckDBPyConnection, name: str) -> int:
+    rows = c.execute(f"""
+        pragma table_info({db.quote_ident(name)})
+        ;
+    """).fetchall()
+    return sum(1 for r in rows if r[1] != ROW_NUM_COLUMN)
+
+
+def _row_num_placeholder(fill_later: bool) -> str:
+    """Row-number expression for a load's select list.  With `fill_later`
+    it is a placeholder that `_number_rows` fills from rowid (far cheaper
+    than row_number() on big loads, and it keeps the column first); views
+    and small loads number inline with row_number()."""
+    return 'cast(null as bigint)' if fill_later else 'row_number() over ()'
+
+
+def _fits_inline(path: Path) -> bool:
+    """True when the whole file fits one inline read buffer and holds few
+    enough rows to number inside the load.  The size check comes first, so
+    long lines at the top of a big file can't talk the estimate down."""
+    size = path.stat().st_size
+    return size <= INLINE_READ_BUFFER_BYTES and _estimated_rows(path, size) <= INLINE_NUMBER_MAX_ROWS
+
+
+def _estimated_rows(path: Path, size: int, sample_bytes: int = 1 << 20) -> int:
+    """Line count extrapolated from the first MB."""
+    with path.open('rb') as f:
+        head = f.read(sample_bytes)
+    if not head:
+        return 0
+    return size * max(head.count(b'\n'), 1) // len(head)
+
+
+def _drop_footer(name: str, rows: int) -> int:
+    """Delete the last `rows` rows (summary lines under the data).  Runs
+    before `_number_rows`, while rowids still run 0..n-1 in file order.
+    Returns how many went."""
+    if rows <= 0:
+        return 0
+    qname = db.quote_ident(name)
+    (deleted,) = db.conn().execute(f"""
+        delete  from {qname}
+        where   rowid >= (select count(*) from {qname}) - ?
+        ;
+    """, [rows]).fetchone()
+    return int(deleted)
+
+
+def _number_rows(name: str) -> None:
+    """Fill the row-number placeholder from rowid, which follows file order."""
+    db.conn().execute(f"""
+        update  {db.quote_ident(name)}
+        set     {db.quote_ident(ROW_NUM_COLUMN)} = rowid + 1
+        ;
+    """)
+
+
+def _save_rejects(c: duckdb.DuckDBPyConnection, name: str) -> tuple[int, int]:
+    """Copy DuckDB's reject_errors into `<name>__rejects` when it has rows.
+    Returns ``(records, lines)``: the rejected records (one can hold several
+    errors) and the source lines they span."""
+    rejected, spanned = c.execute("""
+        select  count(*)
+        ,       coalesce(sum(lines), 0)
+        from (
+            select  line
+            ,       max(1 + length(body) - length(replace(body, chr(10), '')))  as lines
+            from (
+                -- csv_line can carry a line break at either end; drop those
+                select  line
+                ,       trim(coalesce(csv_line, ''), chr(13) || chr(10))  as body
+                from    temp.reject_errors
+            )
+            group   by line
+        )
+        ;
+    """).fetchone()
+    if rejected:
+        rejects_name = _unique_name(f'{name}__rejects')
+        c.execute(f"""
+            create or replace table {db.quote_ident(rejects_name)} as
+            select  *
+            from    temp.reject_errors
+            ;
+        """)
+    _drop_reject_tables(c)
+    return int(rejected), int(spanned)
+
+
+def _drop_reject_tables(c: duckdb.DuckDBPyConnection) -> None:
+    for table in ('reject_errors', 'reject_scans'):
+        c.execute(f"""
+            drop table if exists temp.{table}
+            ;
+        """)
+
+
+def _drop_failed_load(c: duckdb.DuckDBPyConnection, name: str, materialize: bool) -> None:
+    """A retry after a load that worked can leave that load behind."""
+    c.execute(f"""
+        drop {'table' if materialize else 'view'} if exists {db.quote_ident(name)}
+        ;
+    """)
+    _drop_reject_tables(c)
+
+
+# Where DuckDB's own description of the problem ends: hints, the list of
+# encodings it knows, the dialect it searched, the settings dump and the
+# query echo follow.
+_ERROR_TAIL = re.compile(
+    r'^\s*(Possible (fixes|Solution)|The currently supported encodings|The search space used was'
+    r'|file = |LINE \d+:)')
+
+
+def _error_detail(ex: BaseException, max_line: int = 160, max_total: int = 400) -> str:
+    """DuckDB's description of the problem (error type, line number, the
+    echoed row, what went wrong) joined with `|`, clipped to a few hundred
+    characters."""
+    kept: list[str] = []
+    for line in str(ex).splitlines():
+        if _ERROR_TAIL.match(line):
+            break
+        line = line.strip()
+        if line:
+            kept.append(line if len(line) <= max_line else line[:max_line] + '…')
+    detail = ' | '.join(kept)
+    return detail if len(detail) <= max_total else detail[:max_total] + '…'
+
+
+# DuckDB 2.0 read_csv error descriptions → what went wrong.  The message
+# echoes the bad row ("Original Line: ...") before the description, so
+# the last match wins and row text can't pose as the error.
+_CSV_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ('unsupported_encoding', re.compile(
+        r'^(?:Invalid Input Error: )?The CSV Reader does not support the encoding', re.MULTILINE)),
+    ('encoding', re.compile(
+        r'^Invalid unicode \(byte sequence mismatch\) detected\. '
+        r'This file is not \S+ encoded\.$', re.MULTILINE)),
+    ('encoding', re.compile(
+        r'^(?:Invalid Input Error: )?File is not \S+ encoded$', re.MULTILINE)),
+    ('null_padding_quoted_newlines', re.compile(
+        r'^ ?The parallel scanner does not support null_padding in conjunction '
+        r'with quoted new lines\.', re.MULTILINE)),
+    ('columns', re.compile(
+        r'^Expected Number of Columns: (\d+) Found: (\d+)$', re.MULTILINE)),
+    ('line_size', re.compile(
+        r'^Maximum line size of \d+ bytes exceeded\.', re.MULTILINE)),
+    ('quote', re.compile(
+        r'^Value with unterminated quote found\.$', re.MULTILINE)),
+    ('sniff', re.compile(
+        r'^(?:Invalid Input Error: )?Error when sniffing file ', re.MULTILINE)),
 )
+
+
+def _classify_csv_error(message: str) -> str:
+    """Name the problem in a DuckDB read_csv error: 'unsupported_encoding'
+    (final), 'encoding', 'too_few', 'too_many', 'null_padding_quoted_newlines',
+    'line_size', 'quote', 'sniff' (dialect detection failed) or 'other'."""
+    last: tuple[int, str, re.Match[str]] | None = None
+    for kind, pattern in _CSV_ERROR_PATTERNS:
+        for m in pattern.finditer(message):
+            if last is None or m.start() > last[0]:
+                last = (m.start(), kind, m)
+    if last is None:
+        return 'other'
+    _, kind, m = last
+    if kind == 'columns':
+        expected, found = int(m.group(1)), int(m.group(2))
+        return 'too_few' if found < expected else 'too_many'
+    return kind
+
+
+class IngestError(Exception):
+    """Raised when every attempt in the ladder fails."""
 
 
 # --------------------------------------------------------------------------- #
@@ -385,16 +953,31 @@ def _load_parquet(path: Path, opts: IngestOptions) -> IngestResult:
         list_sql = '[' + ', '.join(_sql_path_literal(p) for p in paths) + ']'
         from_clause = f'read_parquet({list_sql}, union_by_name=true)'
         source_path = f'{Path(paths[0]).parent} ({len(paths)} parquet files)'
-    sql = f"""
+    c = db.conn()
+    # DuckDB's file_row_number virtual column numbers a single file for
+    # free (an UPDATE from rowid is slow on parquet-loaded tables).  It
+    # restarts per file, and a real column of that name would shadow it.
+    (shadowed,) = c.execute(f"""
+        select  count(*)
+        from    (describe select * from {from_clause})
+        where   column_name = 'file_row_number'
+        ;
+    """).fetchone()
+    row_num = ('file_row_number + 1' if len(paths) == 1 and not shadowed
+               else 'row_number() over ()')
+    c.execute(f"""
         create or replace {object_kw} {qname} as
-        select  row_number() over ()  as {db.quote_ident(ROW_NUM_COLUMN)}
+        select  {row_num}  as {db.quote_ident(ROW_NUM_COLUMN)}
         ,       *
         from    {from_clause}
         ;
-    """
-    db.conn().execute(sql)
+    """)
+    if opts.materialize:
+        # An all-NULL parquet column comes in typed "NULL", which takes no
+        # values and has no DDL type.
+        db.retype_null_columns(c, name)
     if opts.materialize and opts.nullify_tokens:
-        _nullify_string_tokens(name, opts.nullify_tokens)
+        _nullify_placeholder_tokens(name, opts.nullify_tokens)
     row_count, col_count, cols = _describe(name)
     return IngestResult(
         name=name, source_path=source_path, format='parquet',
@@ -442,33 +1025,124 @@ def inspect_parquet_set(path: str) -> dict:
     }
 
 
-def _nullify_string_tokens(table_name: str, tokens: list[str]) -> None:
-    """Set every VARCHAR cell whose value matches one of the placeholder
-    tokens (NA, N/A, NaN, …) to NULL.  Only meaningful for materialized
-    tables (a view would have nothing to update)."""
-    if not tokens:
-        return
+# Values a placeholder token may sit next to and still be nulled: FQ's
+# number shape (derive.SNAPPABLE_NUMERIC_RE) plus ISO and US dates, each
+# with an optional time.
+_DATE_SHAPE_RE = (
+    r'^(\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?'
+    r'|\d{1,2}/\d{1,2}/(\d{2}|\d{4})( \d{1,2}:\d{2}(:\d{2})?( ?[AP]M)?)?)$'
+)
+
+
+def _nullify_placeholder_tokens(table_name: str, tokens: list[str]) -> None:
+    """Null placeholder tokens (NA, NaN, …) in VARCHAR columns whose other
+    values are all number- or date-shaped, so 'NA' goes in a numeric
+    column but stays as Namibia's code next to 'US' and 'DE'.
+
+    DuckDB's min/max stats rule out most columns for free (text columns,
+    numbers without a token); one query checks the rest and one UPDATE
+    nulls the columns that qualify."""
     c = db.conn()
     qname = db.quote_ident(table_name)
-    cols = c.execute(f"""
+    token_bytes = [t.encode('utf-8') for t in tokens]
+    cols = [col for col, st in _varchar_stats(c, table_name).items()
+            if _may_hold_only_tokens_and_shapes(st, token_bytes)]
+    if not cols:
+        return
+
+    in_tokens = 'in (' + ', '.join(f'${i}' for i in range(1, len(tokens) + 1)) + ')'
+    facts: list[str] = []
+    for col in cols:
+        qcol = db.quote_ident(col)
+        facts += [
+            f'count_if({qcol} {in_tokens})',
+            f'count({qcol})',
+            (f"bool_and({qcol} {in_tokens} "
+             f"or regexp_matches({qcol}, '{derive.SNAPPABLE_NUMERIC_RE}') "
+             f"or regexp_matches({qcol}, '{_DATE_SHAPE_RE}'))"),
+        ]
+    row = c.execute(f"""
+        select  {_select_list(facts)}
+        from    {qname}
+        ;
+    """, tokens).fetchone()
+    qualifying = [
+        db.quote_ident(col)
+        for col, (hits, non_null, all_shaped) in zip(cols, zip(*[iter(row)] * 3))
+        if hits and non_null > hits and all_shaped
+    ]
+    if not qualifying:
+        return
+    sets = '\n        ,       '.join(
+        f'{q} = case when {q} {in_tokens} then null else {q} end' for q in qualifying)
+    where = '\n        or      '.join(f'{q} {in_tokens}' for q in qualifying)
+    c.execute(f"""
+        update  {qname}
+        set     {sets}
+        where   {where}
+        ;
+    """, tokens)
+
+
+def _varchar_stats(c: duckdb.DuckDBPyConnection, table_name: str) -> dict[str, dict | None]:
+    """DuckDB's stats() for each VARCHAR data column; empty for an empty
+    table.  Reading them costs next to nothing."""
+    qname = db.quote_ident(table_name)
+    cols = [r[1] for r in c.execute(f"""
         pragma table_info({qname})
         ;
-    """).fetchall()
-    for row in cols:
-        col_name = row[1]
-        col_type = row[2].upper()
-        if col_type != 'VARCHAR':
-            continue
-        if col_name == ROW_NUM_COLUMN:
-            continue
-        qcol = db.quote_ident(col_name)
-        placeholders = ', '.join(['?'] * len(tokens))
-        c.execute(f"""
-            update  {qname}
-            set     {qcol} = null
-            where   {qcol} in ({placeholders})
-            ;
-        """, list(tokens))
+    """).fetchall() if r[2].upper() == 'VARCHAR' and r[1] != ROW_NUM_COLUMN]
+    if not cols:
+        return {}
+    row = c.execute(f"""
+        select  {_select_list(f'stats({db.quote_ident(col)})' for col in cols)}
+        from    {qname}
+        limit   1
+        ;
+    """).fetchone()
+    return dict(zip(cols, row)) if row else {}
+
+
+def _may_hold_numbers(stats: dict | None) -> bool:
+    """False when a column's stats rule out number-shaped values, which
+    all start with '-' or a digit."""
+    if not stats or not stats.get('has_no_null'):
+        return False
+    lo, hi = stats.get('min'), stats.get('max')
+    if lo is None or hi is None:
+        return True
+    return _stats_bytes(lo)[:1] <= b'9' and _stats_bytes(hi)[:1] >= b'-'
+
+
+def _may_hold_only_tokens_and_shapes(stats: dict | None, tokens: list[bytes]) -> bool:
+    """Cheap check on a column's stats(): False when its min or max is
+    neither a token nor number/date-shaped, or no token fits between
+    them.  The stats hold a prefix of the real min and max."""
+    if not stats or not stats.get('has_no_null'):
+        return False
+    lo, hi = stats.get('min'), stats.get('max')
+    if lo is None or hi is None:
+        return True
+    lo, hi = _stats_bytes(lo), _stats_bytes(hi)
+
+    def plausible(edge: bytes) -> bool:
+        return (edge[:1].isdigit() or edge[:1] == b'-'
+                or any(t.startswith(edge) for t in tokens))
+
+    if not (plausible(lo) and plausible(hi)):
+        return False
+    return any(lo <= t and (t <= hi or t.startswith(hi)) for t in tokens)
+
+
+def _stats_bytes(text: str) -> bytes:
+    """stats() writes quotes, backslashes and non-ASCII bytes as \\xHH."""
+    return re.sub(rb'\\x([0-9A-Fa-f]{2})',
+                  lambda m: bytes([int(m.group(1), 16)]), text.encode('utf-8'))
+
+
+def _select_list(items) -> str:
+    """Leading-comma select list, indented for the 8-space SQL blocks here."""
+    return '\n        ,       '.join(items)
 
 
 # --------------------------------------------------------------------------- #
@@ -516,7 +1190,7 @@ def _load_xlsx(path: Path, opts: IngestOptions) -> IngestResult:
     def _build_sql(p: Path, kw: str) -> str:
         return f"""
             create or replace {kw} {qname} as
-            select  row_number() over ()  as {db.quote_ident(ROW_NUM_COLUMN)}
+            select  {_row_num_placeholder(kw == 'table')}  as {db.quote_ident(ROW_NUM_COLUMN)}
             ,       *
             from    read_xlsx(
                         {_sql_path_literal(str(p))}
@@ -554,6 +1228,8 @@ def _load_xlsx(path: Path, opts: IngestOptions) -> IngestResult:
         if cleaned is not None and cleaned.exists():
             cleaned.unlink(missing_ok=True)
 
+    if opts.materialize or cleaned is not None:
+        _number_rows(name)
     if opts.materialize:
         # read_xlsx with all_varchar=True strips Excel's cell formats,
         # so re-read them via openpyxl and convert date serials → ISO.
@@ -564,11 +1240,10 @@ def _load_xlsx(path: Path, opts: IngestOptions) -> IngestResult:
             )
         except Exception:
             intents = []  # best-effort; don't fail the load
-        _convert_excel_dates(name, intents)
-    if opts.materialize and opts.nullify_tokens:
-        _nullify_string_tokens(name, opts.nullify_tokens)
-    if opts.materialize:
-        _snap_excel_numerics(name)
+        # Tokens first, while the stats still describe the raw cells.
+        if opts.nullify_tokens:
+            _nullify_placeholder_tokens(name, opts.nullify_tokens)
+        _clean_excel_cells(name, intents)
     row_count, col_count, cols = _describe(name)
     return IngestResult(
         name=name, source_path=str(path), format='xlsx',
@@ -577,58 +1252,112 @@ def _load_xlsx(path: Path, opts: IngestOptions) -> IngestResult:
     )
 
 
-def _snap_excel_numerics(table_name: str) -> None:
-    """Round Excel float artifacts in numeric cells to a clean scale.
+def _clean_excel_cells(table_name: str, intents: list[dict]) -> None:
+    """Rewrite raw Excel cell text in one UPDATE.
 
-    Excel stores numeric cells as doubles, so a cell like `=11/3` lands as
-    3.66666666666667. Each numeric cell is rounded to the nearest clean
-    scale (0, 2, 4, or 6) when it sits within `1e-10` of one; anything
-    further out falls through to `round(., 8)` as the upper limit.
+    Date serials in intent-flagged columns become ISO strings.  Intent
+    gates the column; the per-cell branch is picked by value range,
+    because Excel format strings can lie (a `mmss.0`-formatted column may
+    still carry full datetime serials, so we trust the value):
 
-    Scientific-notation cells (DuckDB hands these back for very small or
-    very large numbers) get rewritten to plain decimal by the same cascade.
-    Values too large to fit `decimal(38, N)` keep their original text via
-    the `try_cast` fallback and flow through the export-time fallback path.
+      integer in [367, 73415]               → date (1901..2100)
+      fractional in [367, 73415]            → datetime
+      fraction in [0, 1), time-intent only  → time-of-day
 
-    The cleaned value is cast through `decimal(...)` so integers emit as
-    '5' instead of '5.0'. Trailing-zero trimming is handled later by the
-    type-derivation layer.
+    Excel epoch is 1899-12-30 (the 1900 leap-year quirk).
+
+    Every other numeric cell gets its float artifacts rounded off.  Excel
+    stores numbers as doubles, so a cell like `=11/3` lands as
+    3.66666666666667.  Each one is rounded to the nearest clean scale
+    (0, 2, 4, or 6) when it sits within `1e-10` of one; anything further
+    out falls through to `round(., 8)` as the upper limit.  Scientific
+    notation (DuckDB hands it back for very small or very large numbers)
+    becomes plain decimal the same way.  Values too large for
+    `decimal(38, N)` keep their original text via `try_cast` and flow
+    through the export-time fallback path.  The cleaned value goes
+    through `decimal(...)` so integers read '5' instead of '5.0';
+    trailing-zero trimming happens later in type derivation.
     """
     c = db.conn()
     qname = db.quote_ident(table_name)
-    cols = c.execute(f"""
+    rows = c.execute(f"""
         pragma table_info({qname})
         ;
     """).fetchall()
-    for row in cols:
-        col_name = row[1]
-        col_type = row[2].upper()
-        if col_type != 'VARCHAR':
-            continue
-        if col_name == ROW_NUM_COLUMN:
+    # Pair intents to data columns by position; skip the prepended ROW_NUM.
+    data_cols = [r[1] for r in rows if r[1] != ROW_NUM_COLUMN]
+    stats = _varchar_stats(c, table_name)
+    sets: list[str] = []
+    touched: list[str] = []
+    for i, col_name in enumerate(data_cols):
+        if col_name not in stats:
             continue
         qcol = db.quote_ident(col_name)
-        v = f'cast({qcol} as double)'
-        # try_cast on the inner decimal cast so a magnitude that overflows
-        # decimal(38, N) leaves the cell untouched instead of aborting the
-        # whole UPDATE.
-        def snap(scale: int) -> str:
-            return (f'coalesce(try_cast(try_cast({v} as decimal(38, {scale})) '
-                    f'as varchar), {qcol})')
-        c.execute(f"""
-            update  {qname}
-            set     {qcol} = case
-                                when abs({v}) < 1e-12                       then '0'
-                                when abs({v} - round({v}, 0)) < 1e-10       then {snap(0)}
-                                when abs({v} - round({v}, 2)) < 1e-10       then {snap(2)}
-                                when abs({v} - round({v}, 4)) < 1e-10       then {snap(4)}
-                                when abs({v} - round({v}, 6)) < 1e-10       then {snap(6)}
-                                else                                             {snap(8)}
-                             end
-            where   {qcol} is not null
-            and     regexp_matches({qcol}, '{derive.SNAPPABLE_NUMERIC_RE}')
-            ;
-        """)
+        intent = (intents[i].get('intent') or '') if i < len(intents) else ''
+        branches = _excel_snap_branches(qcol)
+        if intent in ('date', 'datetime', 'time'):
+            branches = _excel_date_branches(qcol, intent) + branches
+            touched.append(f'try_cast({qcol} as double) is not null')
+        elif _may_hold_numbers(stats[col_name]):
+            touched.append(f"regexp_matches({qcol}, '{derive.SNAPPABLE_NUMERIC_RE}')")
+        else:
+            # A multi-column UPDATE rewrites every listed column on each
+            # touched row, so leave out columns with no numbers.
+            continue
+        sets.append(f'{qcol} = case\n                    '
+                    + '\n                    '.join(branches)
+                    + '\n                end')
+    if not sets:
+        return
+    c.execute(f"""
+        update  {qname}
+        set     {_select_list(sets)}
+        where   {' or '.join(touched)}
+        ;
+    """)
+
+
+def _excel_date_branches(qcol: str, intent: str) -> list[str]:
+    as_dbl = f'try_cast({qcol} as double)'
+    date_expr = (f"strftime(date '1899-12-30' "
+                 f"+ cast(floor({as_dbl}) as integer), '%Y-%m-%d')")
+    dt_expr = (f"strftime(timestamp '1899-12-30' "
+               f"+ to_microseconds(cast({as_dbl} * 86400000000 as bigint)), "
+               f"'%Y-%m-%d %H:%M:%S')")
+    branches = [
+        f'when {as_dbl} between 367 and 73415 and {as_dbl} = floor({as_dbl}) then {date_expr}',
+        f'when {as_dbl} between 367 and 73415 then {dt_expr}',
+    ]
+    if intent == 'time':
+        # Gated on intent so stray 0.5s in date columns don't render as
+        # 12:00:00.  strftime() doesn't accept TIME; cast straight to varchar.
+        time_expr = (f"cast(time '00:00:00' "
+                     f"+ to_microseconds(cast({as_dbl} * 86400000000 as bigint)) "
+                     f"as varchar)")
+        branches.append(f'when {as_dbl} >= 0 and {as_dbl} < 1 then {time_expr}')
+    return branches
+
+
+def _excel_snap_branches(qcol: str) -> list[str]:
+    v = f'cast({qcol} as double)'
+
+    # try_cast on the inner decimal cast so a magnitude that overflows
+    # decimal(38, N) leaves the cell untouched instead of aborting the
+    # whole UPDATE.
+    def snap(scale: int) -> str:
+        return (f'coalesce(try_cast(try_cast({v} as decimal(38, {scale})) '
+                f'as varchar), {qcol})')
+
+    return [
+        (f"when {qcol} is null "
+         f"or not regexp_matches({qcol}, '{derive.SNAPPABLE_NUMERIC_RE}') then {qcol}"),
+        f"when abs({v}) < 1e-12 then '0'",
+        f'when abs({v} - round({v}, 0)) < 1e-10 then {snap(0)}',
+        f'when abs({v} - round({v}, 2)) < 1e-10 then {snap(2)}',
+        f'when abs({v} - round({v}, 4)) < 1e-10 then {snap(4)}',
+        f'when abs({v} - round({v}, 6)) < 1e-10 then {snap(6)}',
+        f'else {snap(8)}',
+    ]
 
 
 def _is_styles_xml_error(ex: BaseException) -> bool:
@@ -854,65 +1583,6 @@ def _classify_excel_format(fmt: str) -> str:
     return 'date'  # is_date_format true but no unambiguous tokens
 
 
-def _convert_excel_dates(table_name: str, intents: list[dict]) -> None:
-    """Rewrite Excel date serials to ISO strings in intent-flagged columns.
-
-    Intent gates the column; the per-cell branch is picked by value
-    range, because Excel format strings can lie (a `mmss.0`-formatted
-    column may still carry full datetime serials, so we trust the value):
-
-      integer in [367, 73415]               → date (1901..2100)
-      fractional in [367, 73415]            → datetime
-      fraction in [0, 1), time-intent only  → time-of-day
-      else                                  → unchanged
-
-    Excel epoch is 1899-12-30 (the 1900 leap-year quirk).  try_cast
-    leaves non-numeric cells alone."""
-    if not intents:
-        return
-    c = db.conn()
-    qname = db.quote_ident(table_name)
-    cols = c.execute(f"""
-        pragma table_info({qname})
-        ;
-    """).fetchall()
-    # Pair intents to data columns by position; skip the prepended ROW_NUM.
-    data_cols = [r[1] for r in cols if r[1] != ROW_NUM_COLUMN]
-    for i, info in enumerate(intents):
-        if i >= len(data_cols):
-            break
-        intent = info.get('intent') or ''
-        if intent not in ('date', 'datetime', 'time'):
-            continue
-        qcol = db.quote_ident(data_cols[i])
-        as_dbl = f'try_cast({qcol} as double)'
-        date_expr = (f"strftime(date '1899-12-30' "
-                     f"+ cast(floor({as_dbl}) as integer), '%Y-%m-%d')")
-        dt_expr = (f"strftime(timestamp '1899-12-30' "
-                   f"+ to_microseconds(cast({as_dbl} * 86400000000 as bigint)), "
-                   f"'%Y-%m-%d %H:%M:%S')")
-        # strftime() doesn't accept TIME; cast straight to varchar.
-        time_expr = (f"cast(time '00:00:00' "
-                     f"+ to_microseconds(cast({as_dbl} * 86400000000 as bigint)) "
-                     f"as varchar)")
-        # Time branch gated on intent so stray 0.5s in date columns
-        # don't render as 12:00:00.
-        time_branch = (f"when {as_dbl} >= 0 and {as_dbl} < 1 then {time_expr}"
-                       if intent == 'time' else '')
-        c.execute(f"""
-            update  {qname}
-            set     {qcol} = case
-                                when {as_dbl} between 367 and 73415
-                                 and {as_dbl} = floor({as_dbl})       then {date_expr}
-                                when {as_dbl} between 367 and 73415   then {dt_expr}
-                                {time_branch}
-                                else                                       {qcol}
-                             end
-            where   {qcol} is not null
-            ;
-        """)
-
-
 def _col_index_from_letter(letter: str) -> int:
     """Excel column letter → 1-based index ('A' → 1, 'AA' → 27)."""
     n = 0
@@ -996,65 +1666,6 @@ def _looks_like_excel(path: Path) -> bool:
     return head.startswith(b'PK\x03\x04') or head.startswith(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1')
 
 
-def _detect_encoding(path: Path, sample_bytes: int = 64 * 1024) -> str:
-    with path.open('rb') as f:
-        sample = f.read(sample_bytes)
-    guess = chardet.detect(sample) or {}
-    enc = (guess.get('encoding') or 'utf-8').lower()
-    if enc in ('ascii',):
-        return 'utf-8'
-    return enc
-
-
-# Chardet labels → DuckDB encoding names.  Chardet reports Python's
-# codec names; DuckDB's CSV reader accepts a different (ICU-derived)
-# set.  We map the four encodings that actually turn up in practice
-# for this app's workload; UTF-8, UTF-16, Latin-1, and cp1252 (the
-# catch-all for Windows-sourced text files).  Anything else chardet
-# reports falls through to the ladder's cp1252 fallback; users with
-# unusual encodings can type one into the ingest options.
-_CHARDET_TO_DUCK: dict[str, str] = {
-    'utf-8': 'utf-8',
-    'utf-8-sig': 'utf-8',
-    'ascii': 'utf-8',
-
-    'utf-16': 'utf-16',
-    'utf-16le': 'utf-16',
-    'utf-16be': 'utf-16',
-
-    'iso-8859-1': 'latin-1',
-    'latin-1':    'latin-1',
-    'iso-8859-15': 'latin-1',  # only the Euro sign differs
-
-    'windows-1252': 'cp1252',
-    'cp1252':       'cp1252',
-}
-
-
-def _chardet_to_duckdb(name: str) -> str | None:
-    return _CHARDET_TO_DUCK.get(name.lower())
-
-
-def _sniff_delimiter_bytes(path: Path, sample_bytes: int = 64 * 1024) -> str:
-    """Pick the likeliest delimiter by counting bytes in a raw read.
-    All candidate delimiters (``, | ; \\t``) are ASCII, so we don't
-    have to decode the file first; this runs even when the file's
-    encoding is unknown or wrong.
-    """
-    with path.open('rb') as f:
-        sample = f.read(sample_bytes)
-    try:
-        text = sample.decode('utf-8', errors='replace')
-        dialect = _csv.Sniffer().sniff(text, delimiters=''.join(CANDIDATE_DELIMS))
-        if dialect.delimiter in CANDIDATE_DELIMS:
-            return dialect.delimiter
-    except _csv.Error:
-        pass
-    # Fall back: the candidate with the most byte hits wins.
-    counts = {d: sample.count(d.encode('ascii')) for d in CANDIDATE_DELIMS}
-    return max(CANDIDATE_DELIMS, key=lambda d: counts[d])
-
-
 def _derive_table_name(path: Path) -> str:
     raw = path.stem
     clean = SQL_SAFE_NAME.sub('_', raw).strip('_').lower() or 'table'
@@ -1135,16 +1746,11 @@ def _fmt_params(params: dict) -> str:
             parts.append(f"{k} = {v}")
         elif isinstance(v, str):
             parts.append(f"{k} = {_sql_str_literal(v)}")
-        elif isinstance(v, (list, tuple)):
-            # DuckDB list literal: ['a', 'b'].  Used for read_csv args
-            # like `nullstr` that accept multiple sentinel strings.
-            inner = ', '.join(_sql_str_literal(str(x)) for x in v)
-            parts.append(f"{k} = [{inner}]")
+        elif isinstance(v, list):
+            parts.append(f"{k} = [{', '.join(_sql_str_literal(x) for x in v)}]")
+        elif isinstance(v, dict):
+            inner = ', '.join(f'{_sql_str_literal(a)}: {_sql_str_literal(b)}' for a, b in v.items())
+            parts.append(f'{k} = {{{inner}}}')
         else:
             raise TypeError(f'unsupported param type for {k}: {type(v).__name__}')
     return ', '.join(parts)
-
-
-def duckdb_error_types() -> tuple[type, ...]:
-    import duckdb
-    return (duckdb.Error,)

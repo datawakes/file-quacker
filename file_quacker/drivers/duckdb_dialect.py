@@ -4,19 +4,16 @@ Not strictly a "destination"; DuckDB is our backing store; but we
 emit DuckDB DDL from the Show-DDL drawer and from the Clone dialog,
 so the same dialect interface fits.
 
-Identifiers use ``"double quotes"`` when not bare-safe.  Type names
+Identifiers use ``"double quotes"`` when not bare-safe, which includes
+keywords DuckDB would read as syntax (see ``db.display_ident``).  Type names
 match the ones DuckDB returns from ``pragma table_info`` so a
 round-trip is identity.
 """
 
 from __future__ import annotations
 
-import re
-
+from .. import db
 from .base import Dialect, StringResult, TimestampResult
-
-
-_SAFE_IDENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 _BIGINT_MIN = -(1 << 63)
 _BIGINT_MAX = (1 << 63) - 1
@@ -27,9 +24,7 @@ class DuckDBDialect:
     display_name: str = 'DuckDB'
 
     def quote_ident(self, name: str) -> str:
-        if _SAFE_IDENT.match(name):
-            return name
-        return '"' + name.replace('"', '""') + '"'
+        return db.display_ident(name)
 
     def format_int(self, mn: int, mx: int) -> str | None:
         if 0          <= mn and mx <=          255: return 'tinyint'

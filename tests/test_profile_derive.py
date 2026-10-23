@@ -5,7 +5,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from file_quacker import ingest
+from file_quacker import db, ingest, profile
 from file_quacker.api import Api
 
 
@@ -44,3 +44,33 @@ def test_profile_and_derive_round_trip():
 
     created = api.create_derived_table(r.name, casts=casts, new_name=f'{r.name}_typed')
     assert created['ok']
+
+
+def test_profile_untyped_null_column_in_view():
+    """DuckDB 2.0 types `select null as x` as "NULL"; it profiles as an
+    all-null varchar instead of falling through to 'other'."""
+    db.conn().execute("""
+        create or replace view prof_null_view as
+        select  range   as id
+        ,       null    as nothing
+        from    range(4)
+        ;
+    """)
+    prof = profile.profile_table('prof_null_view', 'nothing')
+    assert prof['kind'] == 'varchar'
+    assert prof['common']['null_count'] == 4
+    assert prof['common']['top_values'] == []
+    assert prof['branch']['min_length'] is None
+    assert prof['branch']['leading_or_trailing_unicode_blank_count'] == 0
+    assert prof['branch']['type_sniff']['integer_pct'] == 0.0
+
+
+def test_profile_counts_unicode_edge_blanks():
+    values = ['\u00a0x', 'x\u2009', '\tx', ' x ', 'caf\u00e9', 'a\u00a0b', 'x']
+    rows = ', '.join(f"('{v}')" for v in values)
+    prof = profile.profile_query(f'select v from (values {rows}) t(v)', 'v')
+    branch = prof['branch']
+    # NBSP and thin space at an edge; the inner NBSP and the accent don't count.
+    assert branch['leading_or_trailing_unicode_blank_count'] == 2
+    # DuckDB's trim() also strips Unicode spaces, but not the tab.
+    assert branch['leading_or_trailing_space_count'] == 3

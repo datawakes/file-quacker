@@ -14,8 +14,11 @@ Branches by DuckDB type:
   * numeric; zero / negative counts, mean, median, stddev,
                   Q1 / Q3 / IQR, outlier count
   * varchar; min / max length (with "first instance" row), empty,
-                  whitespace-only, leading / trailing spaces, contains
-                  spaces, email-match, type-sniff preview
+                  whitespace-only, leading / trailing spaces, leading /
+                  trailing Unicode blanks, contains spaces, email-match,
+                  type-sniff preview.  Untyped NULL columns (DuckDB 2.0's
+                  "NULL" type, e.g. `select null as x` in a view) profile
+                  as varchar, the type they get once stored.
   * date / time; future-date count, date range in days, unique years,
                   earliest, latest
 """
@@ -25,6 +28,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import db
+from .text_values import WS_TRIM_PATTERN
 
 EMAIL_RE = r'^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$'
 
@@ -70,7 +74,7 @@ def _profile(source_sql: str, column_name: str) -> dict:
     if _is_numeric(upper):
         branch = _numeric_stats(c, qsub, qcol)
         kind = 'numeric'
-    elif upper == 'VARCHAR':
+    elif upper in ('VARCHAR', '"NULL"'):
         branch = _varchar_stats(c, qsub, qcol, row_expr, common)
         kind = 'varchar'
     elif upper.startswith('DATE') or upper.startswith('TIMESTAMP'):
@@ -210,13 +214,18 @@ def _varchar_stats(c, qsub: str, qcol: str, row_expr: str, common: dict) -> dict
         ,       sum(case when {qcol} = '' then 1 else 0 end)                  as empty_cnt
         ,       sum(case when {qcol} ~ '^\\s+$' then 1 else 0 end)             as ws_only_cnt
         ,       sum(case when {qcol} <> trim({qcol}) then 1 else 0 end)       as trim_diff_cnt
+        ,       sum(case when strlen({qcol}) = length({qcol}) then 0
+                         when regexp_matches(array_to_string(regexp_extract_all({qcol}, ?), ''),
+                                             '[^\\x00-\\x7f]') then 1
+                         else 0 end)                                          as unicode_blank_cnt
         ,       sum(case when position(' ' in {qcol}) > 0 then 1 else 0 end)  as has_space_cnt
         ,       sum(case when {qcol} ~ ? then 1 else 0 end)                   as email_cnt
         from    {qsub}
         where   {qcol} is not null
         ;
-    """, [EMAIL_RE]).fetchone()
-    min_len, max_len, empty_cnt, ws_only_cnt, trim_diff_cnt, has_space_cnt, email_cnt = row
+    """, [WS_TRIM_PATTERN, EMAIL_RE]).fetchone()
+    (min_len, max_len, empty_cnt, ws_only_cnt, trim_diff_cnt, unicode_blank_cnt,
+     has_space_cnt, email_cnt) = row
 
     # 1st-instance ordinals for the min-length and max-length rows.
     min_first_row = max_first_row = None
@@ -261,6 +270,9 @@ def _varchar_stats(c, qsub: str, qcol: str, row_expr: str, common: dict) -> dict
         'empty_string_count': int(empty_cnt or 0),
         'whitespace_only_count': int(ws_only_cnt or 0),
         'leading_or_trailing_space_count': int(trim_diff_cnt or 0),
+        # Edge blanks (export trim set) with a non-ASCII one in them: NBSP,
+        # thin space, NEL, ... Invisible in the grid.
+        'leading_or_trailing_unicode_blank_count': int(unicode_blank_cnt or 0),
         'contains_space_count': int(has_space_cnt or 0),
         'email_match_count': int(email_cnt or 0),
         'type_sniff': {

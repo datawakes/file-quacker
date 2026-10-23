@@ -21,8 +21,10 @@ from typing import Literal
 
 import pyodbc
 
-from . import db, ddl as ddl_mod, derive, inspect_progress
-from .export_file import _project, _string_columns
+from . import db, ddl as ddl_mod, derive, inspect_progress, naming
+from .drivers import dialect_for
+from .export_file import _project
+from .text_values import string_columns, stripped_source
 from .export_source import ExportSource
 
 
@@ -125,49 +127,15 @@ def _set_progress(**kw) -> None:
 # Identifier quoting + snake_case                                             #
 # --------------------------------------------------------------------------- #
 
-_SAFE_IDENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-
-
 def _qident_ss(name: str) -> str:
-    """SQL Server identifier quoting.
+    """SQL Server identifier quoting, shared with the DDL dialect.
 
-    Leaves safe identifiers (``[A-Za-z_][A-Za-z0-9_]*``) bare; bracket-
-    quotes everything else and escapes embedded ``]`` by doubling it.
-    Auto-snake_case produces bare identifiers for almost every column,
-    so the emitted DDL reads cleanly; a user-edited target with a space
-    or punctuation triggers bracketing on demand.
+    Leaves plain, non-reserved identifiers bare; bracket-quotes everything
+    else (spaces, punctuation, keywords like `order`) and escapes embedded
+    ``]`` by doubling it.  Auto-snake_case produces bare identifiers for
+    almost every column, so the emitted DDL reads cleanly.
     """
-    if _SAFE_IDENT.match(name):
-        return name
-    return '[' + name.replace(']', ']]') + ']'
-
-
-def _unique_target(base: str, taken: set[str]) -> str:
-    """Return ``base`` if free; otherwise ``base_1`` / ``base_2`` / ... until
-    a free name is found. Used to de-dupe target column names so SQL Server
-    doesn't reject the CREATE TABLE."""
-    if base not in taken:
-        return base
-    i = 1
-    while f'{base}_{i}' in taken:
-        i += 1
-    return f'{base}_{i}'
-
-
-def _to_snake_case(name: str) -> str:
-    """Replace space/dot/hyphen with ``_``, split on CamelCase
-    transitions, lowercase, collapse repeated underscores, and strip
-    leading/trailing ``_``.  Acronyms stay glued together
-    (``Patient_ID`` → ``patient_id``).  Characters like ``$`` or ``()``
-    pass through and get bracket-quoted in the emitted SQL.
-    """
-    name = re.sub(r'[ .-]', '_', name)
-    if not name.isupper():
-        name = re.sub(r'(?<!^)(?<!_)(?=[A-Z][a-z])|(?<=[a-z])(?=[A-Z])', '_', name)
-    name = name.lower()
-    name = re.sub(r'_{2,}', '_', name)
-    name = name.strip('_')
-    return name
+    return dialect_for('sqlserver').quote_ident(name)
 
 
 # --------------------------------------------------------------------------- #
@@ -286,7 +254,10 @@ def suggest_mappings(source: 'ExportSource | dict',
 
     ``trim_strings`` defaults to True to match the export dialog's default;
     string columns get sized from their trimmed lengths so a downstream
-    char(N) target won't pad whitespace back into the values.
+    char(N) target won't pad whitespace back into the values, and VARCHAR
+    columns are typed from their trimmed values (an NBSP-padded number
+    maps to decimal). With trim off they're typed from the raw text, the
+    way it gets bound.
     """
     if isinstance(source, dict):
         source = ExportSource(**source)
@@ -311,7 +282,10 @@ def suggest_mappings(source: 'ExportSource | dict',
             def _tick(n: int) -> None:
                 inspect_progress.set_progress(current=non_varchar_count + n)
 
-            analyses = derive._analyze_varchar_cols(qtable, varchar_names, on_done=_tick)
+            # With trim on the export binds stripped values, so the typing
+            # reads them stripped too; with it off, raw like the bind.
+            analyses = derive._analyze_varchar_cols(qtable, varchar_names, on_done=_tick,
+                                                    strip_blanks=trim_strings)
 
             out: list[dict] = []
             taken: set[str] = set()
@@ -320,8 +294,14 @@ def suggest_mappings(source: 'ExportSource | dict',
                     c, qtable, name, duck_type, trim_strings,
                     analysis=analyses.get(name),
                 )
-                nullable = ddl_mod._has_nulls(c, qtable, name)
-                target = _unique_target(_to_snake_case(name), taken)
+                # The trimmed export writes an all-blank value as NULL: count
+                # nulls on the stripped values when the typing read them.
+                analysis = analyses.get(name, {})
+                src = (stripped_source(qtable, db.quote_ident(name))
+                       if analysis.get('stripped') else qtable)
+                nullable = (ddl_mod._has_nulls(c, src, name)
+                            or analysis.get('has_blanks', False))
+                target = naming.unique_name(naming.snake_case(name), taken)
                 taken.add(target)
                 out.append({
                     'source': name,
@@ -387,7 +367,7 @@ def export_to_sqlserver(conn_opts: ConnectionOptions, exp: ExportOptions) -> dic
 
     source_name, source_cleanup = exp.source.materialize()
     qsource = db.quote_ident(source_name)
-    str_cols = _string_columns(qsource) if exp.trim_strings else set()
+    str_cols = string_columns(qsource) if exp.trim_strings else set()
     src_select = ', '.join(
         _project(m.source, m.source in str_cols, exp.trim_strings)
         for m in exp.mappings

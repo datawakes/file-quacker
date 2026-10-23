@@ -14,7 +14,7 @@ rendered through **pywebview**.
 
 The short version: open large flat files quickly, inspect what is actually in
 them, run real SQL, profile columns, derive cleaner typed copies, and export
-the results to SQL Server or another file format — all from your laptop.
+the results to SQL Server or another file format, all from your laptop.
 
 ## Why this exists
 
@@ -142,7 +142,7 @@ already no-op elsewhere), but the build pipeline currently emits a Windows
 ### "Window opens but the body is blank white"
 
 You are probably missing the **Microsoft Edge WebView2 Runtime**. It is *not*
-the same thing as Edge — installing the browser does not necessarily install
+the same thing as Edge; installing the browser does not necessarily install
 the runtime, and vice versa.
 
 | Windows version       | WebView2 Runtime status                          |

@@ -21,6 +21,12 @@ Decimal values are detected by the regex `^-?\\d+(\\.\\d+)?$` and sized
 to the smallest `DECIMAL(P, S)` that holds the observed precision.
 Strict integer detection uses `^-?\\d+$` so `"1.0"` doesn't round
 silently into BIGINT.
+
+Columns whose values carry edge blanks (spaces, tabs, NBSP and other
+Unicode spaces; the set the trimmed file export strips) are analyzed and
+cast with those blanks cut off, so an NBSP-padded `12.50` types as a number
+and an all-blank value counts as null. Clean columns get the plain casts.
+Columns that stay VARCHAR keep their raw text.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ import duckdb
 
 from . import db, inspect_progress, instrument
 from .db import display_ident as _display_ident
+from .text_values import WS_TRIM_PATTERN, string_columns, stripped_source, stripped_sql
 
 SUGGEST_THRESHOLD = 95.0
 # Stricter threshold for callers where a single non-conforming value
@@ -40,6 +47,10 @@ SUGGEST_THRESHOLD = 95.0
 # tinyint column; one bad row aborts the chunk).  Use this when
 # typing decisions can't be reviewed by a human first.
 STRICT_THRESHOLD = 100.0
+# Columns whose best type covers at least this much, but not all, get a full
+# check for edge blanks the sniff sample missed. Padding on more than 10% of
+# the values would almost surely show among the 50 sampled ones.
+NEAR_MISS_THRESHOLD = 90.0
 
 # Broad pre-filter for fallback date detection when no sample is available.
 # It only narrows obvious non-date values; strptime does the real validation.
@@ -122,6 +133,10 @@ class CastSpec:
     # no format. The cast goes through TIMESTAMP first so DuckDB's strict
     # YYYY-MM-DD date parser doesn't reject values like '2024-01-15 00:00:00'.
     via_timestamp: bool = False
+    # Whether the cast retries values with edge blanks cut (`suggest_casts`
+    # says per column). None means unknown and retries too: safe, but it
+    # costs a second conversion on the values the plain cast can't read.
+    strip_blanks: bool | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -174,19 +189,22 @@ def suggest_casts(table_name: str) -> list[dict]:
                 'sample_values': sample,
                 'detected_date_format': fmt,
                 'via_timestamp': via_ts,
+                'strip_blanks': cast_needs_strip(analysis, suggested),
             })
     return out
 
 
-def _timed_analyze_one(qtable: str, col_name: str) -> tuple[str, dict]:
+def _timed_analyze_one(qtable: str, col_name: str,
+                       strip_blanks: bool = True) -> tuple[str, dict]:
     with instrument.timed('_analyze_one', col=col_name):
-        return col_name, _analyze_one(qtable, col_name)
+        return col_name, _analyze_one(qtable, col_name, strip_blanks=strip_blanks)
 
 
 def _analyze_varchar_cols(
     qtable: str,
     col_names: list[str],
     on_done: Callable[[int], None] | None = None,
+    strip_blanks: bool = True,
 ) -> dict[str, dict]:
     """Analyze VARCHAR columns in parallel.
 
@@ -197,6 +215,10 @@ def _analyze_varchar_cols(
     threads improve wall-clock time because DuckDB cursors share the same root
     connection safely.
 
+    Values are read blank-stripped by default, matching the casts
+    `_cast_expr` writes; the SQL Server export passes its trim option
+    instead, since that's how it binds them.
+
     ``on_done(n_completed)`` fires after each result lands; callers wire
     it to the shared inspect-progress counter.
     """
@@ -206,7 +228,7 @@ def _analyze_varchar_cols(
     out: dict[str, dict] = {}
     done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_timed_analyze_one, qtable, n) for n in col_names]
+        futures = [ex.submit(_timed_analyze_one, qtable, n, strip_blanks) for n in col_names]
         for fut in as_completed(futures):
             name, analysis = fut.result()
             out[name] = analysis
@@ -216,7 +238,8 @@ def _analyze_varchar_cols(
     return out
 
 
-def _analyze_one(qtable: str, col_name: str) -> dict:
+def _analyze_one(qtable: str, col_name: str, strip_blanks: bool = False,
+                 force_strip: bool = False) -> dict:
     """Analyze one VARCHAR column using a sniff-gated full-table scan.
 
     Each call uses its own DuckDB cursor. A small ASC/DESC distinct-value sniff
@@ -226,11 +249,32 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
 
     The ASC/DESC bracket helps catch edge-value outliers while keeping the sniff
     small and deterministic.
+
+    ``strip_blanks`` reads values through `stripped_sql`, the way the typed
+    clone casts them. Off by default because the SQL Server export binds the
+    raw text unless its trim option is on. Stripping costs a regex per value
+    per scan, so it only happens when the sniff sample shows edge blanks
+    (``padded`` in the result); clean columns run the plain queries.
+    ``stripped`` says whether the full-table scans read stripped values, so
+    callers can probe the same ones; ``has_blanks`` says the sample held
+    all-blank values, which stripping turns null. Padding the sample missed
+    can still pull a column under 100%; when coverage lands between
+    NEAR_MISS_THRESHOLD and 100% the whole column is checked for edge blanks,
+    and if it has any it's measured again with ``force_strip``.
     """
     c = db.conn()
     qcol = db.quote_ident(col_name)
 
-    sniff = _sniff_one(c, qtable, qcol)
+    raw_qtable = qtable
+    sniff = _sniff_one(c, qtable, qcol, check_padding=strip_blanks)
+    padded = force_strip or sniff['padded'] > 0
+    any_hits = any(sniff[k] for k in ('int', 'dec', 'double', 'bool',
+                                      'raw_date', 'raw_ts', 'cascade_hits'))
+    # A padded plain-text column skips every probe anyway; no need to strip it.
+    stripped = force_strip or (padded and (any_hits or sniff['n'] == 0))
+    if stripped:
+        # Every scan below reads the stripped values.
+        qtable = stripped_source(qtable, qcol)
 
     def _expr(skip: bool, sql: str) -> str:
         return '0' if skip else sql
@@ -362,6 +406,11 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
     )
     all_midnight = raw_all_midnight or cascade_all_midnight
 
+    best = max(date_pct, ts_pct, dec_pct, int_pct, double_pct, pct(ok_bool))
+    if (strip_blanks and not stripped and NEAR_MISS_THRESHOLD <= best < 100.0
+            and _has_edge_blanks(c, raw_qtable, qcol)):
+        return _analyze_one(raw_qtable, col_name, strip_blanks=True, force_strip=True)
+
     return {
         'coverage': {
             'BIGINT':    int_pct,
@@ -383,7 +432,37 @@ def _analyze_one(qtable: str, col_name: str) -> dict:
         'cascade_format':    fmt,
         'all_midnight':      all_midnight,
         'non_null':          non_null,
+        'padded':            padded,
+        'stripped':          stripped,
+        # Blank-only values sort to the sample edges, so the sniff sees them.
+        'has_blanks':        sniff['blanks'] > 0,
     }
+
+
+def _has_edge_blanks(c, qtable: str, qcol: str) -> bool:
+    """Whether any value in the column has edge blanks or is empty."""
+    with instrument.timed('_has_edge_blanks', col=qcol):
+        row = c.execute(f"""
+            select  1
+            from    {qtable}
+            where   {qcol} = ''
+            or      regexp_matches({qcol}, '{WS_TRIM_PATTERN}')
+            limit   1
+            ;
+        """).fetchone()
+    return row is not None
+
+
+def cast_needs_strip(analysis: dict, cast_to: str | None) -> bool:
+    """Whether a cast to ``cast_to`` should retry values with edge blanks
+    cut: the column shows padding, or not every value reads as that type."""
+    if analysis['padded'] or not cast_to:
+        return True
+    cov = analysis['coverage']
+    family = cast_to.split('(')[0].strip().upper()
+    if family in ('DATE', 'TIMESTAMP'):
+        return max(cov['DATE'], cov['TIMESTAMP']) < 100.0
+    return cov.get(family, 0.0) < 100.0
 
 
 def _pick_suggestion(
@@ -456,8 +535,23 @@ _SNIFF_FORMAT_CASES = ',\n            '.join(
     for i, (fmt, _kind) in enumerate(DATE_FORMATS)
 )
 
+# Type probes over the sniff sample `v`; shared by the sniff and its
+# stripped re-run, so their result columns line up.
+_SNIFF_PROBES = """count(v)                                                                 as n
+            ,       sum(case when regexp_matches(v, '^-?(0|[1-9]\\d*)(\\.0+)?$')
+                         and try_cast(v as bigint) is not null then 1 else 0 end)            as ok_int
+            ,       sum(case when regexp_matches(v, '^-?(0|[1-9]\\d*)(\\.\\d+)?$')
+                         then 1 else 0 end)                                                  as ok_dec
+            ,       sum(case when regexp_matches(v, '^-?(0|[1-9]\\d*)(\\.\\d+)?([eE][+-]?\\d+)?$')
+                         and try_cast(v as double) is not null then 1 else 0 end)            as ok_double
+            ,       sum(case when try_cast(v as boolean) is not null then 1 else 0 end)      as ok_bool
+            ,       sum(case when try_cast(v as date) is not null
+                         and cast(try_cast(v as date) as varchar) = v then 1 else 0 end)     as ok_raw_date
+            ,       sum(case when try_cast(v as timestamp) is not null then 1 else 0 end)    as ok_raw_ts
+            ,       """ + _SNIFF_FORMAT_CASES
 
-def _sniff_one(c, qtable: str, qcol: str, n: int = 25) -> dict:
+
+def _sniff_one(c, qtable: str, qcol: str, n: int = 25, check_padding: bool = False) -> dict:
     """Return ASC/DESC distinct-value sniff results for one column.
 
     The sniff keeps up to `n` distinct values from each lexical edge, de-duping
@@ -465,8 +559,12 @@ def _sniff_one(c, qtable: str, qcol: str, n: int = 25) -> dict:
     at one edge from hiding nearby outliers.
 
     The returned hit counts let full-table analysis skip type families that had
-    zero sample hits.
+    zero sample hits. With ``check_padding`` the sample values come back too;
+    when stripping would change any of them (edge blanks, or empty) the probes
+    run again on the stripped values. ``padded`` counts those values and
+    ``blanks`` the ones that strip to nothing.
     """
+    values_sql = '\n            ,       list(v)' if check_padding else ''
     with instrument.timed('_sniff_one', col=qcol, n=n):
         row = c.execute(f"""
             with cte_asc as
@@ -486,25 +584,31 @@ def _sniff_one(c, qtable: str, qcol: str, n: int = 25) -> dict:
                 union
                 select  v from cte_desc
             )
-            select  count(*)                                                                 as n
-            ,       sum(case when regexp_matches(v, '^-?(0|[1-9]\\d*)(\\.0+)?$')
-                         and try_cast(v as bigint) is not null then 1 else 0 end)            as ok_int
-            ,       sum(case when regexp_matches(v, '^-?(0|[1-9]\\d*)(\\.\\d+)?$')
-                         then 1 else 0 end)                                                  as ok_dec
-            ,       sum(case when regexp_matches(v, '^-?(0|[1-9]\\d*)(\\.\\d+)?([eE][+-]?\\d+)?$')
-                         and try_cast(v as double) is not null then 1 else 0 end)            as ok_double
-            ,       sum(case when try_cast(v as boolean) is not null then 1 else 0 end)      as ok_bool
-            ,       sum(case when try_cast(v as date) is not null
-                         and cast(try_cast(v as date) as varchar) = v then 1 else 0 end)     as ok_raw_date
-            ,       sum(case when try_cast(v as timestamp) is not null then 1 else 0 end)    as ok_raw_ts
-            ,       {_SNIFF_FORMAT_CASES}
+            select  {_SNIFF_PROBES}{values_sql}
             from    cte_sample
             ;
         """).fetchone()
+    values = (row[-1] or []) if check_padding else []
+    # Python's str.strip() cuts exactly the text_values.WS_TRIM_PATTERN set.
+    padded = sum(1 for v in values if v == '' or v != v.strip())
+    blanks = 0
+    if padded:
+        stripped = [v.strip() or None for v in values]
+        blanks = stripped.count(None)
+        with instrument.timed('_sniff_one.stripped', col=qcol):
+            row = c.execute(f"""
+                with cte_sample as
+                (   select  unnest(cast(? as varchar[])) as v
+                )
+                select  {_SNIFF_PROBES}
+                from    cte_sample
+                ;
+            """, [stripped]).fetchone()
     if not row or int(row[0] or 0) == 0:
         return {'n': 0, 'int': 0, 'dec': 0, 'double': 0, 'bool': 0,
                 'raw_date': 0, 'raw_ts': 0,
-                'cascade_fmt': None, 'cascade_kind': None, 'cascade_hits': 0}
+                'cascade_fmt': None, 'cascade_kind': None, 'cascade_hits': 0,
+                'padded': padded, 'blanks': blanks}
 
     # Pick the date format with the most sample hits.
     # Ties follow DATE_FORMATS order; zero hits skips full-table date checks.
@@ -530,6 +634,8 @@ def _sniff_one(c, qtable: str, qcol: str, n: int = 25) -> dict:
         'cascade_fmt':  cfmt,
         'cascade_kind': ckind,
         'cascade_hits': best_hits,
+        'padded':       padded,
+        'blanks':       blanks,
     }
 
 
@@ -538,7 +644,7 @@ def _detect_decimal_ps(c, qtable: str, qcol: str) -> tuple[int | None, int | Non
 
     Trailing zeros are stripped first so '15.00' reads as scale 0 and '3.140'
     reads as scale 2. The source is then trusted as-is. Excel float artifacts
-    are already cleaned up at ingest by `ingest._snap_excel_numerics`.
+    are already cleaned up at ingest by `ingest._clean_excel_cells`.
 
     A `has_dot` floor of 1 keeps a column of `1.00`-padded integers from
     collapsing to scale 0, which would break VARCHAR exports that bind to a
@@ -696,9 +802,10 @@ def auto_derive(source_table: str, new_name: str) -> dict:
         name = row[1]
         src_type = row[2]
         if src_type.upper() != 'VARCHAR':
-            cast_to, fmt, via_ts = None, None, False
+            cast_to, fmt, via_ts, strip = None, None, False, False
         else:
             cast_to, fmt, via_ts = _pick_suggestion(analyses[name])
+            strip = cast_needs_strip(analyses[name], cast_to)
         specs.append(CastSpec(
             source=name,
             target=name,
@@ -706,6 +813,7 @@ def auto_derive(source_table: str, new_name: str) -> dict:
             strict=False,
             date_format=fmt,
             via_timestamp=via_ts,
+            strip_blanks=strip,
         ))
     return create_derived_table(source_table, new_name, specs, None)
 
@@ -733,6 +841,7 @@ def create_derived_table(
     create_sql = derive_sql(source_table, new_name, casts, where_clause)
     c = db.conn()
     c.execute(create_sql)
+    db.retype_null_columns(c, new_name)
     qnew = db.quote_ident(new_name)
     (rc,) = c.execute(f"""
         select  count(*)
@@ -769,7 +878,9 @@ def _compose_select(source_table: str, casts: list[CastSpec], where_clause: str 
       * `from    ` / `where   ` – 8-char keyword padding
     """
     src = _display_ident(source_table)
-    items = [(_cast_expr(spec), _display_ident(spec.target)) for spec in casts]
+    str_cols = string_columns(db.quote_ident(source_table))
+    items = [(_cast_expr(spec, spec.source in str_cols), _display_ident(spec.target))
+             for spec in casts]
     # Align `as` across the leading-comma rows (lines 2+).  Line 1 keeps
     # a minimal 2-space gutter so `select <col>  as <col>` stays tight
     # even when the widest expression below is long.
@@ -787,19 +898,31 @@ def _compose_select(source_table: str, casts: list[CastSpec], where_clause: str 
     return f'{sel}\nfrom   {src}{clause}'
 
 
-def _cast_expr(spec: CastSpec) -> str:
+def _cast_expr(spec: CastSpec, is_string: bool = False) -> str:
     src = _display_ident(spec.source)
     if not spec.cast_to:
         return src
+    if (not is_string or spec.strip_blanks is False
+            or spec.cast_to.strip().upper().startswith(('VARCHAR', 'TEXT'))):
+        return _convert(spec, src, spec.strict)
+    # Values the plain conversion can't read get a second try with edge blanks
+    # cut, so an NBSP-padded number lands as a number. CASE only runs the regex
+    # on those values.
+    return (f'case when {_convert(spec, src, strict=False)} is null'
+            f' then {_convert(spec, stripped_sql(src), spec.strict)}'
+            f' else {_convert(spec, src, spec.strict)} end')
+
+
+def _convert(spec: CastSpec, src: str, strict: bool) -> str:
     cast_to = spec.cast_to.strip()
     up = cast_to.upper()
     # Non-ISO dates / timestamps need strptime; plain try_cast only
     # handles ISO `YYYY-MM-DD[...]` forms.
     if spec.date_format and up in ('DATE', 'TIMESTAMP'):
         safe_fmt = spec.date_format.replace("'", "''")
-        fn = 'strptime' if spec.strict else 'try_strptime'
+        fn = 'strptime' if strict else 'try_strptime'
         return f"cast({fn}({src}, '{safe_fmt}') as {cast_to.lower()})"
-    fn = 'cast' if spec.strict else 'try_cast'
+    fn = 'cast' if strict else 'try_cast'
     # Midnight-only TIMESTAMP being downgraded to DATE: cast through
     # TIMESTAMP first so the time portion of the source string doesn't
     # trip DuckDB's strict YYYY-MM-DD date parser.
