@@ -30,8 +30,11 @@ export interface IngestOptions {
   quote?: string
   escape?: string | null
   encoding?: string | null
-  first_row?: number
+  /** 1-based line of the header, 0 = no header row.  Omit to auto-detect. */
+  first_row?: number | null
   skip_rows?: number
+  /** Summary rows to drop from the bottom.  Omit to auto-detect. */
+  skip_footer?: number | null
   ignore_errors?: boolean
   materialize?: boolean
   sheet?: string | null
@@ -95,9 +98,29 @@ export interface IngestResult {
   delimiter: string | null
   encoding: string | null
   first_row: number | null
+  /** Summary rows dropped from the bottom (text files). */
+  footer_rows?: number | null
   /** Which step in the encoding ladder produced a clean load.  Null
    *  for non-text formats.  Useful for debugging; not shown in UI. */
   strategy?: string | null
+  /** Plain-English detection notes, set only when worth telling the
+   *  user (bad bytes, fallback encoding, byte order mark; title lines
+   *  or summary rows). */
+  encoding_note?: string | null
+  layout_note?: string | null
+}
+
+export interface FilePreview {
+  lines: string[]
+  /** Encoding used to decode the preview (the detected one on Auto). */
+  encoding: string
+  encoding_note: string | null
+  sniffed_delimiter: string
+  /** What a plain load would use: header line (0 = none) and summary
+   *  rows dropped from the bottom. */
+  detected_first_row: number
+  detected_footer_rows: number
+  layout_note: string | null
 }
 
 export interface RowsResponse {
@@ -175,6 +198,9 @@ export interface CastSuggestion {
    *  DATE with no format. The cast goes through TIMESTAMP first so the
    *  source's time component doesn't trip DuckDB's date parser. */
   via_timestamp?: boolean
+  /** True when sampled values carry leading / trailing blanks (NBSP etc.)
+   *  that the cast has to strip first. */
+  strip_blanks?: boolean
 }
 
 export interface CastSpec {
@@ -184,6 +210,8 @@ export interface CastSpec {
   strict?: boolean
   date_format?: string | null
   via_timestamp?: boolean
+  /** From `CastSuggestion.strip_blanks`; null lets the backend strip to be safe. */
+  strip_blanks?: boolean | null
 }
 
 export interface DerivePreview {
@@ -366,7 +394,7 @@ interface PywebviewApi {
   open_file_dialog(): Promise<string | null>
   save_file_dialog(default_name: string, file_types?: string[]): Promise<string | null>
   load_file(path: string, opts?: IngestOptions): Promise<IngestResult>
-  preview_file_lines(path: string, n?: number, encoding?: string | null): Promise<{ lines: string[]; encoding: string; sniffed_delimiter: string }>
+  preview_file_lines(path: string, n?: number, encoding?: string | null, delimiter?: string | null): Promise<FilePreview>
   inspect_parquet_set(path: string): Promise<ParquetSetInfo>
   inspect_excel_file(path: string): Promise<ExcelFileInfo>
   load_excel_workbook(path: string, sheet_specs: ExcelSheetSpec[], opts?: IngestOptions): Promise<IngestResult[]>
@@ -481,8 +509,9 @@ export const setWindowTitle  = (title: string)                        => withApi
 export const openFileDialog  = ()                                    => withApi(a => a.open_file_dialog())
 export const saveFileDialog  = (defaultName: string, fileTypes?: string[]) => withApi(a => a.save_file_dialog(defaultName, fileTypes))
 export const loadFile        = (path: string, opts?: IngestOptions)  => withApi(a => a.load_file(path, opts))
-export const previewFileLines = (path: string, n = 30, encoding?: string | null) =>
-  withApi(a => a.preview_file_lines(path, n, encoding ?? null))
+/** `delimiter`, when the user picked one, re-runs header / footer detection with it. */
+export const previewFileLines = (path: string, n = 30, encoding?: string | null, delimiter?: string | null) =>
+  withApi(a => a.preview_file_lines(path, n, encoding ?? null, delimiter ?? null))
 export const inspectParquetSet = (path: string)                       => withApi(a => a.inspect_parquet_set(path))
 export const inspectExcelFile  = (path: string)                       => withApi(a => a.inspect_excel_file(path))
 export const loadExcelWorkbook = (path: string, specs: ExcelSheetSpec[], opts?: IngestOptions) =>

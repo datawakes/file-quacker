@@ -14,6 +14,7 @@ Two concerns live here that api.py would rather not:
 
 from __future__ import annotations
 
+import re
 import time
 from threading import RLock
 from typing import Any
@@ -68,6 +69,11 @@ def _is_result_producing(sql: str) -> bool:
     return any(s.startswith(kw) for kw in _RESULT_KEYWORDS)
 
 
+# Only a `create` can make an untyped NULL column, and the catalog sweep
+# that fixes one costs ~5-10 ms, so plain DML skips it.
+_CREATE_RE = re.compile(r'\bcreate\b', re.IGNORECASE)
+
+
 def run(sql_text: str) -> dict:
     """Execute ``sql_text`` and return a JSON-safe result envelope.
 
@@ -91,6 +97,8 @@ def run(sql_text: str) -> dict:
 
         if not _is_result_producing(sql_text):
             cursor.execute(sql_text)
+            if _CREATE_RE.search(sql_text):
+                db.retype_null_columns(cursor)
             return _empty_envelope(t0)
 
         _result_tick += 1
@@ -113,11 +121,12 @@ def run(sql_text: str) -> dict:
                 pass
             raise
 
-        desc = cursor.execute(f"""
-            pragma table_info({qtable})
-            ;
-        """).fetchall()
-        cols = [{'name': d[1], 'type': d[2]} for d in desc]
+        cols = _columns(cursor, qtable)
+        # Checked here rather than by a retype call so the common case
+        # costs no extra query.
+        if any('"NULL"' in col['type'] for col in cols):
+            db.retype_null_columns(cursor, result_table)
+            cols = _columns(cursor, qtable)
         (n,) = cursor.execute(f"""
             select  count(*)
             from    {qtable}
@@ -150,6 +159,14 @@ def run(sql_text: str) -> dict:
         }
     finally:
         _set_active(None)
+
+
+def _columns(cursor, qtable: str) -> list[dict]:
+    desc = cursor.execute(f"""
+        pragma table_info({qtable})
+        ;
+    """).fetchall()
+    return [{'name': d[1], 'type': d[2]} for d in desc]
 
 
 def _empty_envelope(t0: float) -> dict:
@@ -202,6 +219,7 @@ def save_as_table(sql_text: str, table_name: str) -> dict:
         {sql_text}
         ;
     """)
+    db.retype_null_columns(cursor, table_name)
     (rc,) = cursor.execute(f"""
         select  count(*)
         from    {qname}

@@ -28,7 +28,7 @@ def test_user_set_encoding_short_circuits_ladder():
     p = Path(tempfile.gettempdir()) / 'fq_enc_cp1252.csv'
     p.write_bytes(b'id|note\n1|\x93hello\x94\n2|\x93world\x94\n')
     forced = ingest.load_file(str(p), ingest.IngestOptions(encoding='cp1252'))
-    assert forced.strategy == 'user-set'
+    assert forced.strategy == 'cp1252 (user-set)'
 
 
 def test_broken_row_handled_by_lenient_strategy():

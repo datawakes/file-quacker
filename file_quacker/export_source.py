@@ -41,13 +41,15 @@ class ExportSource:
             # (e.g. `select 1; drop table x;`) are rejected by the
             # parser instead of executing silently.
             inner = self.sql.strip().rstrip(';').strip()
-            db.conn().execute(f"""
+            c = db.conn()
+            c.execute(f"""
                 create table {qtbl} as
                 select * from (
                     {inner}
                 )
                 ;
             """)
+            db.retype_null_columns(c, tbl)
             def _cleanup() -> None:
                 # Best-effort drop.  The caller runs us inside a
                 # `finally`; raising here would hide the real error.

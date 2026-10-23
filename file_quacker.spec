@@ -87,8 +87,10 @@ a = Analysis(
     ],
     # keyring.backends.Windows + its pywin32-ctypes shim are imported
     # dynamically; name them explicitly so the vault works when bundled.
+    # duckdb imports pytz from C++ to fetch TIMESTAMPTZ values, which
+    # static analysis can't see.
     hiddenimports=[
-        'duckdb', 'chardet',
+        'duckdb', 'pytz',
         'keyring.backends.Windows',
         'win32ctypes.core',
         'win32ctypes.core.ctypes',

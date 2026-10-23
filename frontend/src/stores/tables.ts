@@ -62,7 +62,10 @@ export interface IngestSummary {
   delimiter: string | null
   encoding: string | null
   first_row: number | null
+  footer_rows: number | null
   has_rejects: boolean
+  encoding_note: string | null
+  layout_note: string | null
 }
 
 interface TablesState {
@@ -351,6 +354,9 @@ export const useTablesStore = defineStore('tables', {
         await this.selectTable(r.name)
         toasts.dismiss(toastId)
         toasts.show(`Loaded ${fileName} — ${r.row_count.toLocaleString()} rows`, 'success')
+        // Skipped title lines or dropped summary rows change what's in
+        // the table, so say so.
+        if (r.layout_note) toasts.show(`${fileName}: ${r.layout_note}`, 'info', 8000)
         return r
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
@@ -420,7 +426,10 @@ export const useTablesStore = defineStore('tables', {
           delimiter: r.delimiter,
           encoding: r.encoding,
           first_row: r.first_row,
+          footer_rows: r.footer_rows ?? null,
           has_rejects: r.has_rejects,
+          encoding_note: r.encoding_note ?? null,
+          layout_note: r.layout_note ?? null,
         },
       }
     },

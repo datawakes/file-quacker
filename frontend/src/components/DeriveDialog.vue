@@ -66,6 +66,9 @@ interface Row {
   /** Set when a midnight-only TIMESTAMP column is being downgraded to
    *  DATE; tells the backend to cast through TIMESTAMP first. */
   via_timestamp: boolean
+  /** Carried from `suggest_casts`; padding is a property of the source
+   *  column, so it's forwarded whatever type the user picks. */
+  strip_blanks: boolean | null
 }
 
 const rows = ref<Row[]>([])
@@ -97,6 +100,7 @@ onMounted(async () => {
         strict: false,
         date_format: s.detected_date_format,
         via_timestamp: !!s.via_timestamp,
+        strip_blanks: s.strip_blanks ?? null,
       }))
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
@@ -124,6 +128,7 @@ function specsFromRows(): CastSpec[] {
       strict: r.strict,
       date_format: useFmt ? r.date_format : null,
       via_timestamp: useViaTs ? r.via_timestamp : false,
+      strip_blanks: r.strip_blanks,
     }
   })
 }

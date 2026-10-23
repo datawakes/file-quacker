@@ -34,47 +34,64 @@ const PREVIEW_N = 30
 // Preview state
 const lines = ref<string[]>([])
 const detectedEncoding = ref('utf-8')
+const encodingNote = ref<string | null>(null)
 const sniffedDelimiter = ref<string>(',')
+const layoutNote = ref<string | null>(null)
 const previewLoading = ref(true)
 const previewError = ref<string | null>(null)
 
-// Form state
-const firstRow = ref(1)                 // 1-based row number that holds the header
-const skipRows = ref(0)
+// Form state; header row and footer rows start at what was detected and
+// follow re-detection until the user edits them.  `v-model.number` leaves
+// '' in a cleared field, hence the string in the types.
+const firstRow = ref<number | string>(1)  // 1-based row number that holds the header; 0 = no header
+const footerRows = ref<number | string>(0) // summary rows to drop from the bottom
+const headerEdited = ref(false)
+const footerEdited = ref(false)
+const skipRows = ref<number | string>(0)
 const delimiterChoice = ref<'auto' | ',' | '|' | ';' | '\t' | 'custom'>('auto')
 const customDelimiter = ref('')
-const encodingChoice = ref<'auto' | 'utf-8' | 'cp1252' | 'utf-16' | 'utf-16le' | 'utf-16be' | 'latin-1'>('auto')
+const encodingChoice = ref<'auto' | 'utf-8' | 'cp1252' | 'utf-16' | 'utf-16le' | 'latin-1' | 'iso-8859-1'>('auto')
 const quote = ref<string>('"')
 const ignoreErrors = ref(false)
 const busy = ref(false)
 
-async function loadPreview(forEncoding?: string | null) {
+// Quick encoding / delimiter changes can overlap; only the latest
+// request's answer is applied.
+let previewRequest = 0
+
+async function loadPreview() {
+  const request = ++previewRequest
   previewLoading.value = true
   previewError.value = null
   try {
-    const r = await previewFileLines(props.path, PREVIEW_N, forEncoding ?? null)
+    const r = await previewFileLines(props.path, PREVIEW_N, effectiveEncoding(), effectiveDelimiter())
+    if (request !== previewRequest) return
     lines.value = r.lines
     detectedEncoding.value = r.encoding
+    encodingNote.value = r.encoding_note
     sniffedDelimiter.value = r.sniffed_delimiter || ','
+    layoutNote.value = r.layout_note
+    if (!headerEdited.value) firstRow.value = r.detected_first_row
+    if (!footerEdited.value) footerRows.value = r.detected_footer_rows
   } catch (e) {
+    if (request !== previewRequest) return
     previewError.value = e instanceof Error ? e.message : String(e)
     lines.value = []
   } finally {
-    previewLoading.value = false
+    if (request === previewRequest) previewLoading.value = false
   }
 }
 
 onMounted(() => { void loadPreview() })
 
 // Re-decode the preview when the user picks a different encoding so
-// mojibake doesn't linger after they switch.
-watch(encodingChoice, (v) => {
-  if (v === 'auto') void loadPreview()
-  else void loadPreview(v)
-})
+// mojibake doesn't linger, and re-detect header / footer rows when they
+// pick a different delimiter.
+watch([encodingChoice, delimiterChoice, customDelimiter], () => { void loadPreview() })
 
 function selectHeaderRow(idx: number) {
   firstRow.value = idx + 1
+  headerEdited.value = true
 }
 
 function effectiveDelimiter(): string | null {
@@ -87,10 +104,16 @@ function effectiveEncoding(): string | null {
   return encodingChoice.value === 'auto' ? null : encodingChoice.value
 }
 
+/** A cleared number field sends null, which asks the backend to detect it. */
+function finiteOrNull(v: number | string): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null
+}
+
 function buildOpts(): IngestOptions {
   const opts: IngestOptions = {
-    first_row: firstRow.value,
-    skip_rows: skipRows.value,
+    first_row: finiteOrNull(firstRow.value),
+    skip_footer: finiteOrNull(footerRows.value),
+    skip_rows: finiteOrNull(skipRows.value) ?? 0,
     quote: quote.value,
     ignore_errors: ignoreErrors.value,
   }
@@ -236,12 +259,26 @@ function splitOnDelim(line: string): { text: string; isDelim: boolean }[] {
             <label class="mb-1 block text-ink-muted">Header row</label>
             <input
               v-model.number="firstRow"
+              @input="headerEdited = true"
               type="number"
-              min="1"
+              min="0"
               :max="PREVIEW_N"
               class="h-7 w-full rounded border border-border bg-surface-0 px-2 font-mono outline-none focus:border-accent"
             />
-            <p class="mt-1 text-2xs text-ink-subtle">Click a row in the preview to set this.</p>
+            <p class="mt-1 text-2xs text-ink-subtle">Click a row in the preview to set this; 0 means no header row.</p>
+            <p v-if="layoutNote" class="mt-1 text-2xs text-ink-subtle">Detected: {{ layoutNote }}</p>
+          </div>
+
+          <div>
+            <label class="mb-1 block text-ink-muted">Footer rows to drop</label>
+            <input
+              v-model.number="footerRows"
+              @input="footerEdited = true"
+              type="number"
+              min="0"
+              class="h-7 w-full rounded border border-border bg-surface-0 px-2 font-mono outline-none focus:border-accent"
+            />
+            <p class="mt-1 text-2xs text-ink-subtle">Summary lines at the bottom of the file, such as totals.</p>
           </div>
 
           <div>
@@ -277,10 +314,11 @@ function splitOnDelim(line: string): { text: string; isDelim: boolean }[] {
               <option value="utf-8">UTF-8</option>
               <option value="cp1252">Windows-1252 (cp1252)</option>
               <option value="utf-16">UTF-16</option>
-              <option value="utf-16le">UTF-16 LE</option>
-              <option value="utf-16be">UTF-16 BE</option>
-              <option value="latin-1">Latin-1 / ISO-8859-1</option>
+              <option value="utf-16le">UTF-16 LE (no byte order mark)</option>
+              <option value="latin-1">Latin-1 (no bytes 0x80–0x9F)</option>
+              <option value="iso-8859-1">ISO-8859-1 (reads every byte)</option>
             </select>
+            <p v-if="encodingNote" class="mt-1 text-2xs text-ink-subtle">Detected: {{ encodingNote }}</p>
           </div>
 
           <div>
@@ -300,7 +338,7 @@ function splitOnDelim(line: string): { text: string; isDelim: boolean }[] {
           </label>
 
           <div class="mt-auto pt-2 text-2xs text-ink-subtle">
-            <p>If you leave Delimiter / Encoding on Auto, the normal ingest ladder runs.  Setting them here forces the chosen value through every fallback rung.</p>
+            <p>If you leave Delimiter / Encoding on Auto, the normal ingest ladder runs.  Setting them here forces the chosen value through every fallback rung.  Header row and footer rows start at what was detected and are used exactly as set.</p>
           </div>
         </div>
       </div>

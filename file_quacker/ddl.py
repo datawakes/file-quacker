@@ -34,7 +34,7 @@ from .drivers import (
     TimestampResult,
     dialect_for,
 )
-from .export_file import WS_TRIM_PATTERN
+from .text_values import WS_TRIM_PATTERN, stripped_source
 
 
 _DECIMAL_RE = re.compile(r'^DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$', re.IGNORECASE)
@@ -47,6 +47,9 @@ _BIGINT_MAX = (1 << 63) - 1
 # outside require `datetime2`.  The probe captures this as a fact;
 # whether it matters is up to the dialect.
 _DATETIME_FLOOR = '1753-01-01'
+
+# What the string probe reports for a column with no values.
+_NO_STRINGS = StringResult(min_len=0, max_len=1, fixed=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -115,8 +118,14 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
                  d: Dialect, trim_strings: bool = False,
                  analysis: dict | None = None) -> str:
     """Pick the right probe for `duck_type` and hand the result to
-    `d` for naming.  ``trim_strings`` only affects string sizing; numeric
-    / date / timestamp probes don't care."""
+    `d` for naming.  ``trim_strings`` mirrors the export option: string
+    sizing measures trimmed lengths, and VARCHAR typing reads values with
+    edge blanks cut, since that's what the export binds.
+
+    ``analysis`` is an optional pre-computed VARCHAR analysis from
+    ``derive._analyze_one`` (run with ``strip_blanks=trim_strings``); when
+    provided we skip re-running it.  Lets callers analyze many VARCHAR
+    columns in parallel up front and reuse the results here."""
     t = duck_type.upper()
     qcol = db.quote_ident(col_name)
 
@@ -125,6 +134,9 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
     if t == 'DATE':                 return d.format_date()
     if t == 'TIME':                 return d.format_time()
     if t == 'UUID':                 return d.format_uuid()
+    # DuckDB 2.0's type for an untyped NULL (`select null as x`); size it
+    # like an all-null VARCHAR column.
+    if t == '"NULL"':               return d.format_string(_NO_STRINGS)
 
     # ----- branches that need a data probe ----------------------------- #
     if t.startswith('TIMESTAMP'):
@@ -150,22 +162,27 @@ def _column_type(c, qtable: str, col_name: str, duck_type: str,
         return _render_numeric(c, qtable, qcol, d)
 
     if t == 'VARCHAR':
-        suggested, _fmt, _via_ts = _varchar_type_suggestion(qtable, col_name, analysis)
+        if analysis is None:
+            analysis = derive._analyze_one(qtable, col_name, strip_blanks=trim_strings)
+        suggested, _fmt, _via_ts = _varchar_type_suggestion(analysis)
+        # Probe the values the analysis typed: stripped when it read them so.
+        # Clean columns keep the plain table and cost what they did.
+        src = stripped_source(qtable, qcol) if analysis.get('stripped') else qtable
         if suggested:
             up = suggested.upper()
             if up == 'BOOLEAN':
                 if (not getattr(d, 'boolean_accepts_yes_no', True)
-                        and not _has_only_strict_boolean_values(c, qtable, qcol)):
+                        and not _has_only_strict_boolean_values(c, src, qcol)):
                     return d.format_string(_probe_string(c, qtable, qcol, trim_strings))
                 return d.format_boolean()
             if up == 'DATE':        return d.format_date()
             if up == 'TIMESTAMP':
-                return d.format_timestamp(_probe_timestamp(c, qtable, qcol))
+                return d.format_timestamp(_probe_timestamp(c, src, qcol))
             if (up == 'BIGINT'
                     or up in ('DOUBLE', 'FLOAT', 'REAL')
                     or up.startswith('DECIMAL')
                     or up.startswith('NUMERIC')):
-                return _render_numeric(c, qtable, qcol, d)
+                return _render_numeric(c, src, qcol, d)
         return d.format_string(_probe_string(c, qtable, qcol, trim_strings))
 
     return d.format_unknown()
@@ -372,7 +389,7 @@ def _probe_string(c, qtable: str, qcol: str,
             ;
         """).fetchone()
     if row is None or row[1] is None:
-        return StringResult(min_len=0, max_len=1, fixed=False)
+        return _NO_STRINGS
     min_len = int(row[0])
     max_len = max(1, int(row[1]))
     return StringResult(min_len=min_len, max_len=max_len, fixed=(min_len == max_len))
@@ -395,14 +412,11 @@ def _has_only_strict_boolean_values(c, qtable: str, qcol: str) -> bool:
     return int(row[0] or 0) == 0
 
 
-def _varchar_type_suggestion(qtable: str, col_name: str,
-                              analysis: dict | None = None) -> tuple[str | None, str | None, bool]:
-    """Run the Clone analyzer at the strict 100% threshold to pick
-    the column's umbrella (BIGINT, DOUBLE, DECIMAL, DATE, TIMESTAMP,
-    BOOLEAN); a single non-conforming value would break the export
-    bind, so the suggestion has to hold for every non-null row."""
-    if analysis is None:
-        analysis = derive._analyze_one(qtable, col_name)
+def _varchar_type_suggestion(analysis: dict) -> tuple[str | None, str | None, bool]:
+    """Pick the column's umbrella (BIGINT, DOUBLE, DECIMAL, DATE, TIMESTAMP,
+    BOOLEAN) from a Clone analysis at the strict 100% threshold; a single
+    non-conforming value would break the export bind, so the suggestion has
+    to hold for every non-null row."""
     return derive._pick_suggestion(analysis, threshold=derive.STRICT_THRESHOLD)
 
 

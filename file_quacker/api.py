@@ -139,10 +139,12 @@ class Api:
         result = ingest.load_file(path, io)
         return asdict(result)
 
-    def preview_file_lines(self, path: str, n: int = 30, encoding: str | None = None) -> dict:
-        """First N raw lines of a text file; feeds the Open-with-options
-        dialog so the user can identify the real header row."""
-        return ingest.preview_file_lines(path, n=n, encoding=encoding)
+    def preview_file_lines(self, path: str, n: int = 30, encoding: str | None = None,
+                           delimiter: str | None = None) -> dict:
+        """First N raw lines of a text file plus detected encoding,
+        delimiter, header row and footer rows; feeds the Open-with-options
+        dialog.  A delimiter the user picked re-runs layout detection."""
+        return ingest.preview_file_lines(path, n=n, encoding=encoding, delimiter=delimiter)
 
     def inspect_parquet_set(self, path: str) -> dict:
         """Detect sibling .parquet files in the same directory so the
@@ -287,6 +289,7 @@ class Api:
             rename to {qname}
             ;
         """)
+        db.retype_null_columns(c, name)
         return {'ok': True}
 
     # --------------------------------------------------------------------- #

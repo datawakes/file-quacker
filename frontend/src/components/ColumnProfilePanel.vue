@@ -58,6 +58,7 @@ interface VarcharBranch {
   empty_string_count: number
   whitespace_only_count: number
   leading_or_trailing_space_count: number
+  leading_or_trailing_unicode_blank_count: number
   contains_space_count: number
   email_match_count: number
   type_sniff: {
@@ -185,6 +186,7 @@ const temporalBranch = computed<TemporalBranch | null>(() =>
             <dt class="text-ink-muted">empty</dt><dd class="text-ink">{{ fmtNum(varcharBranch.empty_string_count) }}</dd>
             <dt class="text-ink-muted">whitespace-only</dt><dd class="text-ink">{{ fmtNum(varcharBranch.whitespace_only_count) }}</dd>
             <dt class="text-ink-muted">lead/trail spaces</dt><dd class="text-ink">{{ fmtNum(varcharBranch.leading_or_trailing_space_count) }}</dd>
+            <dt class="text-ink-muted">lead/trail unicode blanks</dt><dd class="text-ink">{{ fmtNum(varcharBranch.leading_or_trailing_unicode_blank_count) }}</dd>
             <dt class="text-ink-muted">contains spaces</dt><dd class="text-ink">{{ fmtNum(varcharBranch.contains_space_count) }}</dd>
             <dt class="text-ink-muted">email-ish</dt><dd class="text-ink">{{ fmtNum(varcharBranch.email_match_count) }}</dd>
           </dl>

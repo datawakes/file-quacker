@@ -100,7 +100,7 @@ const showSqlResult = computed(() =>
           <span class="opacity-70">Delimiter:</span>
           <span class="ml-1">{{ delimiterLabel(activeIngest.delimiter) }}</span>
         </span>
-        <span v-if="activeIngest && activeIngest.format === 'csv'">
+        <span v-if="activeIngest && activeIngest.format === 'csv'" :title="activeIngest.encoding_note ?? undefined">
           <span class="opacity-70">Encoding:</span>
           <span class="ml-1">{{ activeIngest.encoding || '—' }}</span>
         </span>
