@@ -881,23 +881,23 @@ def _error_detail(ex: BaseException, max_line: int = 160, max_total: int = 400) 
 # the last match wins and row text can't pose as the error.
 _CSV_ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ('unsupported_encoding', re.compile(
-        r'^(?:Invalid Input Error: )?The CSV Reader does not support the encoding', re.M)),
+        r'^(?:Invalid Input Error: )?The CSV Reader does not support the encoding', re.MULTILINE)),
     ('encoding', re.compile(
         r'^Invalid unicode \(byte sequence mismatch\) detected\. '
-        r'This file is not \S+ encoded\.$', re.M)),
+        r'This file is not \S+ encoded\.$', re.MULTILINE)),
     ('encoding', re.compile(
-        r'^(?:Invalid Input Error: )?File is not \S+ encoded$', re.M)),
+        r'^(?:Invalid Input Error: )?File is not \S+ encoded$', re.MULTILINE)),
     ('null_padding_quoted_newlines', re.compile(
         r'^ ?The parallel scanner does not support null_padding in conjunction '
-        r'with quoted new lines\.', re.M)),
+        r'with quoted new lines\.', re.MULTILINE)),
     ('columns', re.compile(
-        r'^Expected Number of Columns: (\d+) Found: (\d+)$', re.M)),
+        r'^Expected Number of Columns: (\d+) Found: (\d+)$', re.MULTILINE)),
     ('line_size', re.compile(
-        r'^Maximum line size of \d+ bytes exceeded\.', re.M)),
+        r'^Maximum line size of \d+ bytes exceeded\.', re.MULTILINE)),
     ('quote', re.compile(
-        r'^Value with unterminated quote found\.$', re.M)),
+        r'^Value with unterminated quote found\.$', re.MULTILINE)),
     ('sniff', re.compile(
-        r'^(?:Invalid Input Error: )?Error when sniffing file ', re.M)),
+        r'^(?:Invalid Input Error: )?Error when sniffing file ', re.MULTILINE)),
 )
 
 
@@ -1057,9 +1057,9 @@ def _nullify_placeholder_tokens(table_name: str, tokens: list[str]) -> None:
         facts += [
             f'count_if({qcol} {in_tokens})',
             f'count({qcol})',
-            f"bool_and({qcol} {in_tokens} "
-            f"or regexp_matches({qcol}, '{derive.SNAPPABLE_NUMERIC_RE}') "
-            f"or regexp_matches({qcol}, '{_DATE_SHAPE_RE}'))",
+            (f"bool_and({qcol} {in_tokens} "
+             f"or regexp_matches({qcol}, '{derive.SNAPPABLE_NUMERIC_RE}') "
+             f"or regexp_matches({qcol}, '{_DATE_SHAPE_RE}'))"),
         ]
     row = c.execute(f"""
         select  {_select_list(facts)}
@@ -1349,8 +1349,8 @@ def _excel_snap_branches(qcol: str) -> list[str]:
                 f'as varchar), {qcol})')
 
     return [
-        f"when {qcol} is null "
-        f"or not regexp_matches({qcol}, '{derive.SNAPPABLE_NUMERIC_RE}') then {qcol}",
+        (f"when {qcol} is null "
+         f"or not regexp_matches({qcol}, '{derive.SNAPPABLE_NUMERIC_RE}') then {qcol}"),
         f"when abs({v}) < 1e-12 then '0'",
         f'when abs({v} - round({v}, 0)) < 1e-10 then {snap(0)}',
         f'when abs({v} - round({v}, 2)) < 1e-10 then {snap(2)}',
