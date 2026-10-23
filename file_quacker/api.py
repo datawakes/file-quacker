@@ -365,10 +365,14 @@ class Api:
     # DDL                                                                   #
     # --------------------------------------------------------------------- #
     def generate_ddl(self, table_name: str, dialect: str = 'duckdb') -> dict:
+        """``sql`` keeps the workspace names; ``sql_snake`` has the
+        snake_case ones.  Both come from one analysis, so the panel can
+        flip between them without asking again."""
         # Validation lives inside the dialect registry; unknown ids
         # raise KeyError there, which surfaces as a clear message
         # rather than the cryptic dispatch failure we'd otherwise hit.
-        return {'sql': ddl_mod.generate(table_name, dialect)}
+        variants = ddl_mod.generate_variants(table_name, dialect)
+        return {'sql': variants['as-is'], 'sql_snake': variants['snake']}
 
     def list_dialects(self) -> list[dict]:
         """Every registered DDL dialect.  The frontend uses this to

@@ -429,7 +429,8 @@ interface PywebviewApi {
     where_clause?: string | null,
   ): Promise<DeriveCreated>
   auto_derive(source_table: string, new_name: string): Promise<DeriveCreated>
-  generate_ddl(table_name: string, dialect: 'duckdb' | 'sqlserver'): Promise<{ sql: string }>
+  /** `sql` keeps workspace names; `sql_snake` uses snake_case ones. */
+  generate_ddl(table_name: string, dialect: 'duckdb' | 'sqlserver'): Promise<{ sql: string; sql_snake: string }>
   check_odbc_driver(): Promise<OdbcDriverCheck>
   test_sqlserver_connection(conn_opts: SqlServerConnectionOptions, profile_id?: string | null): Promise<{ ok: boolean; server_version?: string; error?: string }>
   list_sqlserver_databases(conn_opts: SqlServerConnectionOptions, profile_id?: string | null): Promise<string[]>

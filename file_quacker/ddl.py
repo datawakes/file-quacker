@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 
-from . import db, derive, inspect_progress, instrument
+from . import db, derive, inspect_progress, instrument, naming
 from .drivers import (
     Dialect,
     NumericResult,
@@ -57,14 +57,26 @@ _NO_STRINGS = StringResult(min_len=0, max_len=1, fixed=False)
 # --------------------------------------------------------------------------- #
 
 def generate(table_name: str, dialect: str = 'sqlserver',
-             trim_strings: bool = False) -> str:
+             trim_strings: bool = False, snake_names: bool = False) -> str:
     """Render a CREATE TABLE statement in `dialect`.  Defaults to
     SQL Server; any registered dialect id is valid.
 
     ``trim_strings`` mirrors the export-time option: when on, string
     columns are sized from their trimmed lengths so a downstream
     char(N) target won't pad whitespace back into the trimmed values.
+
+    ``snake_names`` renames the table and columns the way the SQL Server
+    export does (`claim.id` → `claim_id`), so most need no quoting.
     """
+    return generate_variants(table_name, dialect, trim_strings)['snake' if snake_names else 'as-is']
+
+
+def generate_variants(table_name: str, dialect: str = 'sqlserver',
+                      trim_strings: bool = False) -> dict[str, str]:
+    """The CREATE TABLE text with workspace names (``'as-is'``) and with
+    snake_case names (``'snake'``), from one column analysis.  The names
+    only matter once the text is formatted, so the panel can flip
+    between the two without re-probing every column."""
     # Drain any leftover events from a prior run so this run's summary
     # only reflects work this call did.
     instrument.take()
@@ -91,10 +103,20 @@ def generate(table_name: str, dialect: str = 'sqlserver',
                 col_infos.append({'name': name, 'sql_type': sql_type, 'nullable': nullable})
                 inspect_progress.set_progress(current=i + 1)
 
-        rendered = _format(table_name, col_infos, d)
+        taken: set[str] = set()
+        snake_infos: list[dict] = []
+        for info in col_infos:
+            name = naming.unique_name(naming.snake_case(info['name']), taken)
+            taken.add(name)
+            snake_infos.append({**info, 'name': name})
+        rendered = {
+            'as-is': _format(table_name, col_infos, d),
+            'snake': _format(naming.snake_case(table_name), snake_infos, d),
+        }
 
     if instrument.enabled:
-        return rendered + '\n' + instrument.format_summary(instrument.take())
+        summary = instrument.format_summary(instrument.take())
+        return {k: v + '\n' + summary for k, v in rendered.items()}
     return rendered
 
 

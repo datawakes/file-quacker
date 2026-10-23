@@ -3,7 +3,7 @@
 // Text is selectable for copy/paste; a Copy button writes the whole DDL
 // to the clipboard in one shot.
 
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { Copy, X } from 'lucide-vue-next'
 import { generateDdl } from '../lib/api'
 import { useInspectProgress } from '../composables/useInspectProgress'
@@ -13,29 +13,48 @@ const props = defineProps<{ table: string }>()
 defineEmits<{ (e: 'close'): void }>()
 
 type Dialect = 'duckdb' | 'sqlserver'
+type Names = 'as-is' | 'snake'
+
+// Snake-case names (the Export to SQL naming) need no brackets; as-is
+// keeps the workspace names, bracketed where they need it.
+const NAMES_KEY = 'fq.ddl.names'
 
 const toasts = useToasts()
 const dialect = ref<Dialect>('sqlserver')
-const sql = ref<string>('')
+const names = ref<Names>(readNames())
+// Both name variants come back from one analysis; the toggle just picks one.
+const variants = ref<Record<Names, string>>({ 'as-is': '', snake: '' })
+const sql = computed(() => variants.value[names.value])
 const loading = ref(false)
 const error = ref<string | null>(null)
 const { label: inspectLabel, start: startInspectPoll, stop: stopInspectPoll } = useInspectProgress()
+let requestId = 0
 
 async function load() {
+  const id = ++requestId
   loading.value = true
   error.value = null
   startInspectPoll()
   try {
     const r = await generateDdl(props.table, dialect.value)
-    sql.value = r.sql
+    if (id !== requestId) return
+    variants.value = { 'as-is': r.sql, snake: r.sql_snake }
   } catch (e) {
+    if (id !== requestId) return
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
-    stopInspectPoll()
-    loading.value = false
+    if (id === requestId) {
+      stopInspectPoll()
+      loading.value = false
+    }
   }
 }
 
+function readNames(): Names {
+  try { return localStorage.getItem(NAMES_KEY) === 'as-is' ? 'as-is' : 'snake' } catch { return 'snake' }
+}
+
+watch(names, (n) => { try { localStorage.setItem(NAMES_KEY, n) } catch { /* ignore */ } })
 watch(() => [props.table, dialect.value] as const, load, { immediate: true })
 
 async function onCopy() {
@@ -86,6 +105,22 @@ function onPanelCopy(e: ClipboardEvent) {
         :class="{ 'mode-btn-on': dialect === 'duckdb' }"
         @click="dialect = 'duckdb'"
       >DuckDB</button>
+      <div class="ml-auto flex items-center gap-0.5" role="group" aria-label="Column names">
+        <button
+          type="button"
+          class="mode-btn mode-btn-sm"
+          :class="{ 'mode-btn-on': names === 'as-is' }"
+          title="Workspace names as they are; brackets where a name needs them"
+          @click="names = 'as-is'"
+        >as-is</button>
+        <button
+          type="button"
+          class="mode-btn mode-btn-sm"
+          :class="{ 'mode-btn-on': names === 'snake' }"
+          title="snake_case names, as Export to SQL uses (claim.id becomes claim_id)"
+          @click="names = 'snake'"
+        >snake_case</button>
+      </div>
     </div>
 
     <!-- Body -->
@@ -103,6 +138,9 @@ function onPanelCopy(e: ClipboardEvent) {
 <style scoped>
 .mode-btn {
   @apply inline-flex items-center rounded px-2 py-0.5 font-medium text-xs text-ink-muted transition-colors hover:text-ink;
+}
+.mode-btn-sm {
+  @apply px-1.5 text-2xs;
 }
 .mode-btn-on {
   @apply bg-surface-2 text-ink;

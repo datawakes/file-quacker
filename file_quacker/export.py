@@ -21,7 +21,7 @@ from typing import Literal
 
 import pyodbc
 
-from . import db, ddl as ddl_mod, derive, inspect_progress
+from . import db, ddl as ddl_mod, derive, inspect_progress, naming
 from .drivers import dialect_for
 from .export_file import _project
 from .text_values import string_columns, stripped_source
@@ -136,34 +136,6 @@ def _qident_ss(name: str) -> str:
     almost every column, so the emitted DDL reads cleanly.
     """
     return dialect_for('sqlserver').quote_ident(name)
-
-
-def _unique_target(base: str, taken: set[str]) -> str:
-    """Return ``base`` if free; otherwise ``base_1`` / ``base_2`` / ... until
-    a free name is found. Used to de-dupe target column names so SQL Server
-    doesn't reject the CREATE TABLE."""
-    if base not in taken:
-        return base
-    i = 1
-    while f'{base}_{i}' in taken:
-        i += 1
-    return f'{base}_{i}'
-
-
-def _to_snake_case(name: str) -> str:
-    """Replace space/dot/hyphen with ``_``, split on CamelCase
-    transitions, lowercase, collapse repeated underscores, and strip
-    leading/trailing ``_``.  Acronyms stay glued together
-    (``Patient_ID`` → ``patient_id``).  Characters like ``$`` or ``()``
-    pass through and get bracket-quoted in the emitted SQL.
-    """
-    name = re.sub(r'[ .-]', '_', name)
-    if not name.isupper():
-        name = re.sub(r'(?<!^)(?<!_)(?=[A-Z][a-z])|(?<=[a-z])(?=[A-Z])', '_', name)
-    name = name.lower()
-    name = re.sub(r'_{2,}', '_', name)
-    name = name.strip('_')
-    return name
 
 
 # --------------------------------------------------------------------------- #
@@ -329,7 +301,7 @@ def suggest_mappings(source: 'ExportSource | dict',
                        if analysis.get('stripped') else qtable)
                 nullable = (ddl_mod._has_nulls(c, src, name)
                             or analysis.get('has_blanks', False))
-                target = _unique_target(_to_snake_case(name), taken)
+                target = naming.unique_name(naming.snake_case(name), taken)
                 taken.add(target)
                 out.append({
                     'source': name,
